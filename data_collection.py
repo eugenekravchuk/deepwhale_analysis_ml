@@ -1,3 +1,4 @@
+import argparse
 import os
 import time
 import pandas as pd
@@ -13,6 +14,9 @@ ALCHEMY_URL = os.getenv("ALCHEMY_URL")
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 OUTPUT_CSV = DATA_DIR / "raw_whale_transactions.csv"
+
+# Скільки останніх блоків зчитати (≈2.8 доби при ~12 с/блок; ~20k для довшого вікна)
+NUM_BLOCKS_DEFAULT = 20_000
 
 WHALE_THRESHOLD_ETH = 10
 
@@ -122,11 +126,22 @@ def append_or_create(new_df: pd.DataFrame, path: Path) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Collect large ETH transfers from recent blocks.")
+    parser.add_argument(
+        "--blocks",
+        type=int,
+        default=NUM_BLOCKS_DEFAULT,
+        metavar="N",
+        help=f"How many recent blocks to scan (default: {NUM_BLOCKS_DEFAULT}).",
+    )
+    args = parser.parse_args()
+    n = max(1, args.blocks)
+
     latest_block = w3.eth.block_number
     print(f"Latest block: {latest_block}")
-    print(f"Collecting {500} blocks ({latest_block - 500} → {latest_block}) ...")
+    print(f"Collecting {n} blocks ({latest_block - n} → {latest_block}) ...")
 
-    df_whales = collect_whale_data(latest_block, num_blocks=500)
+    df_whales = collect_whale_data(latest_block, num_blocks=n)
 
     if df_whales.empty:
         print("No whale transactions found in this range.")
