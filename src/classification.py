@@ -104,6 +104,7 @@ def log_transform(df: pd.DataFrame) -> pd.DataFrame:
 def load_data(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Load clustered data and split into train/test by time."""
     df = pd.read_csv(path)
+    df = df.drop(columns=['net_flow_eth'], errors='ignore')
     print(f"Loaded {len(df)} clustered addresses")
 
     if TARGET_COL not in df.columns:

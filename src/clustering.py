@@ -51,7 +51,6 @@ FEATURE_COLS = [
     "gas_variability",
     "hour_entropy",
     "active_days",
-    "net_flow_eth",
 ]
 
 CLUSTER_PALETTE = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c"]
@@ -70,6 +69,7 @@ def load_and_prepare(csv_path: Path, labeled_csv: Path | None = None) -> tuple[p
     """Load features, impute NaNs, log-transform heavy-tailed columns, then scale."""
     source = labeled_csv if (labeled_csv and labeled_csv.exists()) else csv_path
     df = pd.read_csv(source)
+    df = df.drop(columns=['net_flow_eth'], errors='ignore')
     print(f"Loaded {len(df)} addresses from {source.name}")
 
     df_feat = df[FEATURE_COLS].copy()
@@ -85,12 +85,6 @@ def load_and_prepare(csv_path: Path, labeled_csv: Path | None = None) -> tuple[p
     for col in LOG_COLS:
         if col in df_feat.columns:
             df_feat[col] = np.log1p(df_feat[col].clip(lower=0))
-
-    if "net_flow_eth" in df_feat.columns:
-        # Rank-based transform: maps to [0, 1] percentiles.
-        # Avoids the bimodal split that sign*log1p creates, which causes
-        # KMeans to form clusters purely by flow direction.
-        df_feat["net_flow_eth"] = df_feat["net_flow_eth"].rank(pct=True)
 
     scaler = RobustScaler()
     X = scaler.fit_transform(df_feat.values)
@@ -306,7 +300,7 @@ def plot_radar(df: pd.DataFrame, cluster_col: str, out_path: Path):
 def print_cluster_profiles(df: pd.DataFrame, cluster_col: str):
     profile_cols = [
         "tx_count_out", "total_eth_out", "avg_tx_eth", "unique_receivers",
-        "exchange_ratio", "round_number_ratio", "active_days", "net_flow_eth",
+        "exchange_ratio", "round_number_ratio", "active_days",
     ]
     avail = [c for c in profile_cols if c in df.columns]
     print("\n=== Cluster Profiles (medians) ===")
