@@ -1,26 +1,28 @@
 DeepWhale — Model Training Log
 ================================
 
-Date: 2026-04-30
+Date: 2026-05-01
 
 --- Classification (classification.py) ---
-Dataset: 6638 addresses (5 dropped, label_confidence < 0.25)
-Train/Test split: 5310 / 1328 (temporal, by first_seen)
-Classes: accumulator, active_trader, exchange_depositor, unknown_whale
+Target: KMeans cluster labels (0-3) from clustering.py
+Dataset: 6643 addresses
+Train/Test split: 5314 / 1329 (temporal, by first_seen)
+Preprocessing: log1p on financial columns + RobustScaler (synced with clustering.py)
+Classes (4): Large One-Shot Movers, Mega-Whale Traders, Small Whales, Mid-Range Regulars
 
 XGBoost:
-  F1 macro (test):  1.0000
-  F1 macro (5-fold Stratified CV): 0.9969 +/- 0.0032
-  Fold scores: [0.9927, 0.9983, 1.0000, 0.9934, 1.0000]
+  F1 macro (test):  0.9935
+  F1 macro (5-fold Stratified CV): 0.9827 +/- 0.0048
+  Fold scores: [0.9867, 0.9861, 0.9772, 0.9767, 0.9870]
   Params: n_estimators=200, max_depth=4, lr=0.1, subsample=0.8
 
 Random Forest:
-  F1 macro (test):  0.7498
-  Note: RF misclassifies active_trader (only 1 sample in test set)
+  F1 macro (test):  0.9762
   Params: n_estimators=200, max_depth=6
 
 Best model: XGBoost
 Classification quality: GOOD (F1 >= 0.65)
+SHAP: summary + per-cluster plots generated
 
 --- Clustering (clustering.py) ---
 Dataset: 6643 addresses
@@ -42,16 +44,45 @@ Clustering quality: GOOD (>= 0.3)
 
 --- Anomaly Detection (anomaly_detection.py) ---
 Dataset: 6643 addresses
-Isolation Forest: contamination=0.10, n_estimators=200
-Anomalous addresses: 665 / 6643 (10.0%)
+Two-layer approach:
 
-Pearson correlation — anomalous whale tx vs ETH price change: 0.259
+Layer 1 — Isolation Forest (contamination="auto", n_estimators=300):
+  Threshold determined automatically from score distribution (Liu et al., 2008)
+  Global anomalies: 1232 / 6643 (18.5%)
+
+Layer 2 — Intra-cluster Mahalanobis distance (p95 threshold):
+  Cluster 0 (Large One-Shot Movers): 46 outliers (Mahalanobis > 8.73)
+  Cluster 1 (Mega-Whale Traders):    18 outliers (Mahalanobis > 6.13)
+  Cluster 2 (Small Whales):         224 outliers (Mahalanobis > 8.34)
+  Cluster 3 (Mid-Range Regulars):    46 outliers (Mahalanobis > 6.03)
+  Total intra-cluster anomalies: 334
+
+Combined:
+  Total anomalies: 1374 / 6643 (20.7%)
+  Global only: 1040 | Intra-cluster only: 142 | Both: 192
+
+Feature contributions: each anomaly has top-3 feature explanation
+  (e.g. "tx_count_out (high, 12.1σ); std_tx_eth (high, 8.4σ)")
+
+Pearson correlation — anomalous whale tx vs ETH price change: 0.241
 Pearson correlation — all whale tx vs ETH price change: 0.250
 
---- Changes Made (Agent B) ---
-1. Created pipeline_runner.ipynb (end-to-end orchestration notebook)
-2. Added StratifiedKFold 5-fold cross-validation to classification.py
-3. Added per-class SHAP breakdown (shap_per_class.png) to classification.py
-4. Auto-tuned DBSCAN eps via k-distance elbow plot in clustering.py
-5. Added pagination to dashboard.py tab 1 (Live Whales)
-6. Created this progress.txt
+--- Dashboard (dashboard.py) ---
+Streamlit UI with 4 tabs:
+  1. Live Whales — filterable transaction table with pagination, cluster labels, anomaly flags
+  2. Address Profiler — real-time XGBoost classification + SHAP explanation + anomaly status
+  3. Anomaly Explorer — browse anomalies by type, see explanations, score distribution
+  4. Market Context — ETH price overlay, cluster distribution, interactive PCA scatter
+
+Run: streamlit run dashboard.py
+
+--- Pipeline Summary ---
+data_collection.py → feature_engineering.py → clustering.py → classification.py → anomaly_detection.py → dashboard.py
+
+Key design decisions:
+  - KMeans clusters used as classification target (cluster-then-predict pattern)
+  - log1p + RobustScaler preprocessing consistent across all modules
+  - Anomaly detection uses auto threshold (not arbitrary contamination %)
+  - Two-layer anomalies: global (IF) + intra-cluster (Mahalanobis)
+  - SHAP per-cluster explanations for interpretability
+  - Model bundle includes all preprocessing params for real-time inference
