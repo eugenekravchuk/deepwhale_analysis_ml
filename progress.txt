@@ -1,0 +1,57 @@
+DeepWhale — Model Training Log
+================================
+
+Date: 2026-04-30
+
+--- Classification (classification.py) ---
+Dataset: 6638 addresses (5 dropped, label_confidence < 0.25)
+Train/Test split: 5310 / 1328 (temporal, by first_seen)
+Classes: accumulator, active_trader, exchange_depositor, unknown_whale
+
+XGBoost:
+  F1 macro (test):  1.0000
+  F1 macro (5-fold Stratified CV): 0.9969 +/- 0.0032
+  Fold scores: [0.9927, 0.9983, 1.0000, 0.9934, 1.0000]
+  Params: n_estimators=200, max_depth=4, lr=0.1, subsample=0.8
+
+Random Forest:
+  F1 macro (test):  0.7498
+  Note: RF misclassifies active_trader (only 1 sample in test set)
+  Params: n_estimators=200, max_depth=6
+
+Best model: XGBoost
+Classification quality: GOOD (F1 >= 0.65)
+
+--- Clustering (clustering.py) ---
+Dataset: 6643 addresses
+Preprocessing: log1p on financial columns + RobustScaler (fixes power-law / mega-whale distortion)
+
+KMeans k=4 (preferred over k=2 for richer segmentation, silhouette within 19%):
+  Cluster 0 — Large One-Shot Movers:  911 addresses (median 200 ETH, 1 tx)
+  Cluster 1 — Mega-Whale Traders:     350 addresses (median 2216 ETH, 7 txs)
+  Cluster 2 — Small Whales:          4462 addresses (median 21 ETH, 1 tx)
+  Cluster 3 — Mid-Range Regulars:     920 addresses (median 127 ETH, 3 txs)
+
+DBSCAN:
+  eps: 1.227 (auto-tuned via kneedle method on k-distance curve)
+  min_samples: 5
+  Core points: 6134, Noise/outliers: 509 (7.7%)
+
+Final silhouette score (KMeans k=4): 0.4539
+Clustering quality: GOOD (>= 0.3)
+
+--- Anomaly Detection (anomaly_detection.py) ---
+Dataset: 6643 addresses
+Isolation Forest: contamination=0.10, n_estimators=200
+Anomalous addresses: 665 / 6643 (10.0%)
+
+Pearson correlation — anomalous whale tx vs ETH price change: 0.259
+Pearson correlation — all whale tx vs ETH price change: 0.250
+
+--- Changes Made (Agent B) ---
+1. Created pipeline_runner.ipynb (end-to-end orchestration notebook)
+2. Added StratifiedKFold 5-fold cross-validation to classification.py
+3. Added per-class SHAP breakdown (shap_per_class.png) to classification.py
+4. Auto-tuned DBSCAN eps via k-distance elbow plot in clustering.py
+5. Added pagination to dashboard.py tab 1 (Live Whales)
+6. Created this progress.txt

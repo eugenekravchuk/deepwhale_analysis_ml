@@ -299,14 +299,14 @@ with tab1:
     with col_ctrl1:
         min_eth = st.slider("Min ETH value", 10, 500, 10, step=10)
     with col_ctrl2:
-        n_rows = st.selectbox("Show last N transactions", [25, 50, 100, 200], index=1)
+        page_size = st.selectbox("Rows per page", [25, 50, 100, 200], index=1)
     with col_ctrl3:
         show_anomalies_only = st.checkbox("Show anomalous addresses only", value=False)
 
     if raw_df.empty:
         st.warning("No transaction data found. Run `python data_collection.py` first.")
     else:
-        display = raw_df[raw_df["value_eth"] >= min_eth].head(n_rows).copy()
+        filtered = raw_df[raw_df["value_eth"] >= min_eth].copy()
 
         known_set = load_known_addresses()
         if not anomaly_df.empty:
@@ -314,15 +314,42 @@ with tab1:
         else:
             anomaly_set = set()
 
-        display["exchange_flag"] = display["to_address"].apply(
+        filtered["exchange_flag"] = filtered["to_address"].apply(
             lambda a: "🏦" if str(a).lower() in known_set else ""
         )
-        display["anomaly_flag"] = display["from_address"].apply(
+        filtered["anomaly_flag"] = filtered["from_address"].apply(
             lambda a: "🚨" if a in anomaly_set else ""
         )
 
         if show_anomalies_only:
-            display = display[display["anomaly_flag"] != ""]
+            filtered = filtered[filtered["anomaly_flag"] != ""]
+
+        total_rows = len(filtered)
+        total_pages = max(1, (total_rows + page_size - 1) // page_size)
+
+        if "whale_page" not in st.session_state:
+            st.session_state.whale_page = 1
+        if st.session_state.whale_page > total_pages:
+            st.session_state.whale_page = total_pages
+
+        page_col1, page_col2, page_col3 = st.columns([1, 2, 1])
+        with page_col1:
+            if st.button("← Previous", disabled=st.session_state.whale_page <= 1):
+                st.session_state.whale_page -= 1
+                st.rerun()
+        with page_col2:
+            st.markdown(
+                f"<div style='text-align:center'>Page {st.session_state.whale_page} / {total_pages}"
+                f" &nbsp;({total_rows:,} transactions)</div>",
+                unsafe_allow_html=True,
+            )
+        with page_col3:
+            if st.button("Next →", disabled=st.session_state.whale_page >= total_pages):
+                st.session_state.whale_page += 1
+                st.rerun()
+
+        start_idx = (st.session_state.whale_page - 1) * page_size
+        display = filtered.iloc[start_idx : start_idx + page_size]
 
         show_cols = ["timestamp", "from_address", "to_address", "value_eth",
                      "value_usd", "gas_price_gwei", "exchange_flag", "anomaly_flag"]

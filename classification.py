@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 classification.py
 =================
@@ -32,6 +34,7 @@ from sklearn.metrics import (
     f1_score,
     ConfusionMatrixDisplay,
 )
+from sklearn.model_selection import StratifiedKFold, cross_val_score
 from xgboost import XGBClassifier
 
 warnings.filterwarnings("ignore")
@@ -215,6 +218,93 @@ def plot_shap(model, X_train: np.ndarray, feature_names: list[str], out_path: Pa
     print(f"  Saved {out_path.name}")
 
 
+def plot_shap_per_class(model, X_train: np.ndarray, feature_names: list[str],
+                        class_names: list[str], out_dir: Path):
+    """Generate one SHAP importance bar chart per class."""
+    if not SHAP_AVAILABLE:
+        return
+    print("  Computing per-class SHAP values ...")
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_train)
+
+    if isinstance(shap_values, list):
+        per_class = [np.asarray(s) for s in shap_values]
+    else:
+        sv = np.asarray(shap_values)
+        if sv.ndim == 3:
+            per_class = [sv[:, :, c] for c in range(sv.shape[2])]
+        else:
+            per_class = [sv]
+
+    n_feat = min(len(feature_names), per_class[0].shape[1])
+    n_classes = min(len(class_names), len(per_class))
+    fnames = feature_names[:n_feat]
+
+    cols = min(n_classes, 2)
+    rows = (n_classes + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(8 * cols, 5 * rows))
+    fig.patch.set_facecolor("#0d1117")
+    if n_classes == 1:
+        axes = [axes]
+    else:
+        axes = np.array(axes).flatten()
+
+    class_colors = ["#3498db", "#2ecc71", "#e74c3c", "#f39c12", "#9b59b6", "#1abc9c"]
+
+    for i in range(n_classes):
+        ax = axes[i]
+        ax.set_facecolor("#0d1117")
+        mean_abs = np.abs(per_class[i][:, :n_feat]).mean(axis=0)
+        sorted_idx = np.argsort(mean_abs)
+        color = class_colors[i % len(class_colors)]
+        ax.barh(
+            [fnames[int(j)] for j in sorted_idx],
+            mean_abs[sorted_idx],
+            color=color, alpha=0.85,
+        )
+        ax.set_xlabel("Mean |SHAP value|", color="white")
+        ax.set_title(f"SHAP — {class_names[i]}", color="white", fontsize=12)
+        ax.tick_params(colors="white")
+        ax.spines[:].set_color("#333")
+
+    for i in range(n_classes, len(axes)):
+        axes[i].set_visible(False)
+
+    plt.suptitle("Per-Class SHAP Feature Impact", color="white", fontsize=14, y=1.01)
+    plt.tight_layout()
+    out_path = out_dir / "shap_per_class.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"  Saved {out_path.name}")
+
+
+def run_cross_validation(X: np.ndarray, y: np.ndarray, n_classes: int, n_splits: int = 5):
+    """StratifiedKFold CV on XGBoost to get a robust F1 macro estimate."""
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    xgb_params = dict(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        eval_metric="mlogloss",
+        objective="multi:softprob" if n_classes > 2 else "binary:logistic",
+        random_state=42,
+        verbosity=0,
+    )
+    if n_classes > 2:
+        xgb_params["num_class"] = n_classes
+
+    cv_scores = cross_val_score(
+        XGBClassifier(**xgb_params), X, y,
+        cv=skf, scoring="f1_macro", n_jobs=-1,
+    )
+    print(f"\n[Cross-Validation] {n_splits}-fold Stratified CV (XGBoost)")
+    print(f"  Fold F1 scores: {[f'{s:.4f}' for s in cv_scores]}")
+    print(f"  Mean F1 macro:  {cv_scores.mean():.4f} +/- {cv_scores.std():.4f}")
+    return cv_scores
+
+
 def save_model(xgb_model, rf_model, scaler, le, feature_names, path: Path):
     bundle = {
         "xgb": xgb_model,
@@ -245,6 +335,9 @@ def main():
 
     X_train, y_train = prepare_xy(train_df, scaler, le, fit=True)
     X_test, y_test = prepare_xy(test_df, scaler, le, fit=False)
+
+    # ── Cross-Validation ────────────────────────────────────────────────────
+    cv_scores = run_cross_validation(X_train, y_train, n_classes=len(class_names))
 
     # ── XGBoost ─────────────────────────────────────────────────────────────
     print("\n[XGBoost] Training ...")
@@ -285,6 +378,7 @@ def main():
     )
     plot_feature_importance(xgb, avail_features, DATA_DIR / "feature_importance.png")
     plot_shap(xgb, X_train, avail_features, DATA_DIR / "shap_summary.png")
+    plot_shap_per_class(xgb, X_train, avail_features, class_names, DATA_DIR)
 
     # ── Random Forest (comparison) ────────────────────────────────────────
     print("\n[Random Forest] Training ...")
@@ -312,8 +406,9 @@ def main():
 
     # ── Summary ──────────────────────────────────────────────────────────
     print("\n=== Model Comparison ===")
-    print(f"  XGBoost   F1-macro: {f1_xgb:.4f}")
-    print(f"  RF        F1-macro: {f1_rf:.4f}")
+    print(f"  XGBoost   F1-macro (test): {f1_xgb:.4f}")
+    print(f"  XGBoost   F1-macro (CV):   {cv_scores.mean():.4f} +/- {cv_scores.std():.4f}")
+    print(f"  RF        F1-macro (test): {f1_rf:.4f}")
     winner = "XGBoost" if f1_xgb >= f1_rf else "Random Forest"
     print(f"  Best model: {winner}")
 
