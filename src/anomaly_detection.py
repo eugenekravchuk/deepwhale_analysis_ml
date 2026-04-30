@@ -85,8 +85,8 @@ def log_transform(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = np.log1p(df[col].clip(lower=0))
     if "net_flow_eth" in df.columns:
-        nf = df["net_flow_eth"]
-        df["net_flow_eth"] = np.sign(nf) * np.log1p(nf.abs())
+        # Rank-based transform: matches clustering.py / classification.py
+        df["net_flow_eth"] = df["net_flow_eth"].rank(pct=True)
     return df
 
 

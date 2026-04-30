@@ -67,7 +67,10 @@ FEATURE_COLS = [
     "gas_variability",
     "hour_entropy",
     "active_days",
-    "net_flow_eth",
+    # net_flow_eth excluded: its bimodal distribution causes the classifier
+    # to use it as a shortcut instead of learning behavioural patterns.
+    # Clusters are formed without net_flow_eth dominance, so the classifier
+    # should learn to distinguish them using the same behavioural features.
 ]
 
 # Financial columns that need log1p (must match clustering.py exactly)
@@ -95,9 +98,6 @@ def log_transform(df: pd.DataFrame) -> pd.DataFrame:
     for col in LOG_COLS:
         if col in df.columns:
             df[col] = np.log1p(df[col].clip(lower=0))
-    if "net_flow_eth" in df.columns:
-        nf = df["net_flow_eth"]
-        df["net_flow_eth"] = np.sign(nf) * np.log1p(nf.abs())
     return df
 
 
