@@ -3,16 +3,22 @@ from __future__ import annotations
 """
 classification.py
 =================
-Supervised whale-type classification.
+Supervised whale-type classification using KMeans cluster labels as target.
+
+The clustering step (clustering.py) groups whales into behavioural clusters
+using unsupervised learning. This script trains XGBoost to predict those
+cluster labels on new, unseen addresses in real-time, and produces SHAP
+explanations showing which features drove each prediction.
 
 Pipeline:
-  1. Load labeled_addresses.csv (from labeling.py)
-  2. Time-based train/test split (earlier blocks → train, later → test)
-     to avoid data leakage from the future.
-  3. Train XGBoost (primary) and Random Forest (comparison)
-  4. Evaluate: F1 macro, confusion matrix, classification report
-  5. SHAP summary plot to explain feature importance
-  6. Save trained model to models/whale_classifier.pkl
+  1. Load clustered_addresses.csv (from clustering.py)
+  2. Apply the same log1p + RobustScaler preprocessing as clustering
+  3. Time-based train/test split (80/20 by first_seen)
+  4. StratifiedKFold cross-validation for robust F1 estimate
+  5. Train XGBoost (primary) and Random Forest (comparison)
+  6. Evaluate: F1 macro, confusion matrix, classification report
+  7. SHAP summary + per-class SHAP plots
+  8. Save trained model to models/whale_classifier.pkl
 
 Run:
   python classification.py
@@ -26,7 +32,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
-from sklearn.preprocessing import RobustScaler, LabelEncoder
+from sklearn.preprocessing import RobustScaler
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     classification_report,
@@ -44,13 +50,13 @@ try:
     SHAP_AVAILABLE = True
 except ImportError:
     SHAP_AVAILABLE = False
-    print("shap not installed — SHAP plot will be skipped.")
+    print("shap not installed — SHAP plots will be skipped.")
 
 DATA_DIR = Path(__file__).parent / "data"
 MODELS_DIR = Path(__file__).parent / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 
-LABELED_CSV = DATA_DIR / "labeled_addresses.csv"
+CLUSTERED_CSV = DATA_DIR / "clustered_addresses.csv"
 MODEL_PKL = MODELS_DIR / "whale_classifier.pkl"
 
 FEATURE_COLS = [
@@ -71,31 +77,53 @@ FEATURE_COLS = [
     "net_flow_eth",
 ]
 
-TARGET_COL = "label"
-CONFIDENCE_THRESHOLD = 0.25  # drop very low-confidence labels from training
+# Financial columns that need log1p (must match clustering.py exactly)
+LOG_COLS = [
+    "tx_count_out", "total_eth_out", "avg_tx_eth", "median_tx_eth",
+    "max_tx_eth", "std_tx_eth", "unique_receivers", "avg_gas_gwei",
+    "gas_variability", "active_days",
+]
+
+TARGET_COL = "kmeans_cluster"
+
+CLUSTER_NAMES = {
+    0: "Large One-Shot Movers",
+    1: "Mega-Whale Traders",
+    2: "Small Whales",
+    3: "Mid-Range Regulars",
+}
+
+
+# ── Data loading & preprocessing ───────────────────────────────────────────
+
+def log_transform(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply log1p to heavy-tailed columns (mirrors clustering.py)."""
+    df = df.copy()
+    for col in LOG_COLS:
+        if col in df.columns:
+            df[col] = np.log1p(df[col].clip(lower=0))
+    if "net_flow_eth" in df.columns:
+        nf = df["net_flow_eth"]
+        df["net_flow_eth"] = np.sign(nf) * np.log1p(nf.abs())
+    return df
 
 
 def load_data(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load labeled data and split into train/test by time (first_seen date)."""
+    """Load clustered data and split into train/test by time."""
     df = pd.read_csv(path)
-    print(f"Loaded {len(df)} labeled addresses")
+    print(f"Loaded {len(df)} clustered addresses")
 
-    # Drop low-confidence samples for cleaner training signal
-    if "label_confidence" in df.columns:
-        before = len(df)
-        df = df[df["label_confidence"] >= CONFIDENCE_THRESHOLD]
-        print(f"  Kept {len(df)} (dropped {before - len(df)} low-confidence)")
+    if TARGET_COL not in df.columns:
+        raise ValueError(
+            f"Column '{TARGET_COL}' not found. Run clustering.py first."
+        )
 
     # Impute missing numeric features
     for col in FEATURE_COLS:
         if col in df.columns and df[col].isna().any():
             df[col] = df[col].fillna(df[col].median())
 
-    if len(df) < 8:
-        raise ValueError(
-            "Too few labeled samples for classification. "
-            "Run data_collection.py with more blocks first."
-        )
+    print(f"  Cluster distribution:\n{df[TARGET_COL].value_counts().sort_index().to_string()}")
 
     # Time-based split: 80% earliest → train, 20% latest → test
     if "first_seen" in df.columns:
@@ -106,29 +134,34 @@ def load_data(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         df_sorted = df.copy()
 
     split_idx = int(len(df_sorted) * 0.80)
-    train = df_sorted.iloc[:split_idx]
-    test = df_sorted.iloc[split_idx:]
+    train = df_sorted.iloc[:split_idx].copy()
+    test = df_sorted.iloc[split_idx:].copy()
     print(f"  Train: {len(train)}  |  Test: {len(test)}")
     return train, test
 
 
-def prepare_xy(df: pd.DataFrame, scaler: RobustScaler | None, le: LabelEncoder,
+def prepare_xy(df: pd.DataFrame, scaler: RobustScaler,
                fit: bool = False) -> tuple[np.ndarray, np.ndarray]:
+    """Extract features, apply log1p + scale, return X and y."""
     avail = [c for c in FEATURE_COLS if c in df.columns]
-    X = df[avail].values
-    y = le.transform(df[TARGET_COL].values)
+    df_feat = log_transform(df[avail])
+    X = df_feat.values
 
     if fit:
         X = scaler.fit_transform(X)
     else:
         X = scaler.transform(X)
+
+    y = df[TARGET_COL].values.astype(int)
     return X, y
 
 
+# ── Plotting ────────────────────────────────────────────────────────────────
+
 def plot_confusion_matrix(
-    y_true, y_pred, class_names: list[str], out_path: Path, labels: list[int] | None = None
+    y_true, y_pred, class_names: list[str], out_path: Path,
+    labels: list[int] | None = None,
 ):
-    """labels: integer class indices 0..n-1 so rows/cols match when test set omits a class."""
     if labels is None:
         labels = list(range(len(class_names)))
     cm = confusion_matrix(y_true, y_pred, labels=labels)
@@ -137,7 +170,7 @@ def plot_confusion_matrix(
     fig.patch.set_facecolor("#0d1117")
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
     disp.plot(ax=ax, colorbar=False, cmap="Blues")
-    ax.set_title("Confusion Matrix — Whale Classifier", color="white", fontsize=13)
+    ax.set_title("Confusion Matrix — Whale Cluster Classifier", color="white", fontsize=13)
     for text in ax.texts:
         text.set_color("white")
     ax.tick_params(colors="white")
@@ -159,13 +192,13 @@ def plot_feature_importance(model, feature_names: list[str], out_path: Path):
     ax.set_facecolor("#0d1117")
     fig.patch.set_facecolor("#0d1117")
     colors = plt.cm.plasma(np.linspace(0.2, 0.9, len(importances)))
-    bars = ax.barh(
+    ax.barh(
         [feature_names[i] for i in indices][::-1],
         importances[indices][::-1],
         color=colors,
     )
     ax.set_xlabel("Feature Importance (gain)", color="white")
-    ax.set_title("XGBoost Feature Importance", color="white", fontsize=13)
+    ax.set_title("XGBoost Feature Importance — Cluster Prediction", color="white", fontsize=13)
     ax.tick_params(colors="white")
     ax.spines[:].set_color("#333")
     plt.tight_layout()
@@ -181,8 +214,6 @@ def plot_shap(model, X_train: np.ndarray, feature_names: list[str], out_path: Pa
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X_train)
 
-    # Multiclass: list of (n_samples, n_features), 3D (n_samples, n_features, n_classes),
-    # or 2D (n_samples, n_features) for binary / single-output
     if isinstance(shap_values, list):
         stacked = np.stack([np.asarray(s) for s in shap_values], axis=0)
         mean_shap = np.abs(stacked).mean(axis=(0, 1))
@@ -209,7 +240,7 @@ def plot_shap(model, X_train: np.ndarray, feature_names: list[str], out_path: Pa
         color=colors,
     )
     ax.set_xlabel("Mean |SHAP value|", color="white")
-    ax.set_title("SHAP Feature Impact (mean absolute, all classes)", color="white", fontsize=13)
+    ax.set_title("SHAP Feature Impact (mean absolute, all clusters)", color="white", fontsize=13)
     ax.tick_params(colors="white")
     ax.spines[:].set_color("#333")
     plt.tight_layout()
@@ -220,10 +251,10 @@ def plot_shap(model, X_train: np.ndarray, feature_names: list[str], out_path: Pa
 
 def plot_shap_per_class(model, X_train: np.ndarray, feature_names: list[str],
                         class_names: list[str], out_dir: Path):
-    """Generate one SHAP importance bar chart per class."""
+    """Generate one SHAP importance bar chart per cluster."""
     if not SHAP_AVAILABLE:
         return
-    print("  Computing per-class SHAP values ...")
+    print("  Computing per-cluster SHAP values ...")
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X_train)
 
@@ -249,7 +280,7 @@ def plot_shap_per_class(model, X_train: np.ndarray, feature_names: list[str],
     else:
         axes = np.array(axes).flatten()
 
-    class_colors = ["#3498db", "#2ecc71", "#e74c3c", "#f39c12", "#9b59b6", "#1abc9c"]
+    class_colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c"]
 
     for i in range(n_classes):
         ax = axes[i]
@@ -270,7 +301,7 @@ def plot_shap_per_class(model, X_train: np.ndarray, feature_names: list[str],
     for i in range(n_classes, len(axes)):
         axes[i].set_visible(False)
 
-    plt.suptitle("Per-Class SHAP Feature Impact", color="white", fontsize=14, y=1.01)
+    plt.suptitle("Per-Cluster SHAP Feature Impact", color="white", fontsize=14, y=1.01)
     plt.tight_layout()
     out_path = out_dir / "shap_per_class.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -278,8 +309,10 @@ def plot_shap_per_class(model, X_train: np.ndarray, feature_names: list[str],
     print(f"  Saved {out_path.name}")
 
 
+# ── Cross-validation ────────────────────────────────────────────────────────
+
 def run_cross_validation(X: np.ndarray, y: np.ndarray, n_classes: int, n_splits: int = 5):
-    """StratifiedKFold CV on XGBoost to get a robust F1 macro estimate."""
+    """StratifiedKFold CV on XGBoost for robust F1 macro estimate."""
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     xgb_params = dict(
         n_estimators=200,
@@ -288,12 +321,11 @@ def run_cross_validation(X: np.ndarray, y: np.ndarray, n_classes: int, n_splits:
         subsample=0.8,
         colsample_bytree=0.8,
         eval_metric="mlogloss",
-        objective="multi:softprob" if n_classes > 2 else "binary:logistic",
+        objective="multi:softprob",
+        num_class=n_classes,
         random_state=42,
         verbosity=0,
     )
-    if n_classes > 2:
-        xgb_params["num_class"] = n_classes
 
     cv_scores = cross_val_score(
         XGBClassifier(**xgb_params), X, y,
@@ -305,43 +337,48 @@ def run_cross_validation(X: np.ndarray, y: np.ndarray, n_classes: int, n_splits:
     return cv_scores
 
 
-def save_model(xgb_model, rf_model, scaler, le, feature_names, path: Path):
+# ── Model persistence ───────────────────────────────────────────────────────
+
+def save_model(xgb_model, rf_model, scaler, cluster_names, feature_names, path: Path):
     bundle = {
         "xgb": xgb_model,
         "rf": rf_model,
         "scaler": scaler,
-        "label_encoder": le,
+        "cluster_names": cluster_names,
         "feature_cols": feature_names,
+        "log_cols": LOG_COLS,
     }
     with open(path, "wb") as f:
         pickle.dump(bundle, f)
     print(f"  Model bundle saved to {path}")
 
 
+# ── Main ────────────────────────────────────────────────────────────────────
+
 def main():
-    if not LABELED_CSV.exists():
-        raise FileNotFoundError(f"{LABELED_CSV} not found. Run labeling.py first.")
+    if not CLUSTERED_CSV.exists():
+        raise FileNotFoundError(
+            f"{CLUSTERED_CSV} not found. Run clustering.py first."
+        )
 
-    train_df, test_df = load_data(LABELED_CSV)
+    train_df, test_df = load_data(CLUSTERED_CSV)
 
-    le = LabelEncoder()
-    le.fit(pd.concat([train_df, test_df])[TARGET_COL].values)
-    class_names = list(le.classes_)
-    label_indices = list(range(len(class_names)))
-    print(f"Classes: {class_names}")
+    n_classes = train_df[TARGET_COL].nunique()
+    class_names = [CLUSTER_NAMES.get(i, f"Cluster {i}") for i in range(n_classes)]
+    label_indices = list(range(n_classes))
+    print(f"Classes ({n_classes}): {class_names}")
 
     scaler = RobustScaler()
     avail_features = [c for c in FEATURE_COLS if c in train_df.columns]
 
-    X_train, y_train = prepare_xy(train_df, scaler, le, fit=True)
-    X_test, y_test = prepare_xy(test_df, scaler, le, fit=False)
+    X_train, y_train = prepare_xy(train_df, scaler, fit=True)
+    X_test, y_test = prepare_xy(test_df, scaler, fit=False)
 
     # ── Cross-Validation ────────────────────────────────────────────────────
-    cv_scores = run_cross_validation(X_train, y_train, n_classes=len(class_names))
+    cv_scores = run_cross_validation(X_train, y_train, n_classes=n_classes)
 
     # ── XGBoost ─────────────────────────────────────────────────────────────
     print("\n[XGBoost] Training ...")
-    n_classes = len(class_names)
     xgb_params = dict(
         n_estimators=200,
         max_depth=4,
@@ -349,12 +386,11 @@ def main():
         subsample=0.8,
         colsample_bytree=0.8,
         eval_metric="mlogloss",
-        objective="multi:softprob" if n_classes > 2 else "binary:logistic",
+        objective="multi:softprob",
+        num_class=n_classes,
         random_state=42,
         verbosity=0,
     )
-    if n_classes > 2:
-        xgb_params["num_class"] = n_classes
     xgb = XGBClassifier(**xgb_params)
     xgb.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
     y_pred_xgb = xgb.predict(X_test)
@@ -365,8 +401,7 @@ def main():
     print(f"  F1 macro (XGBoost): {f1_xgb:.4f}")
     print(
         classification_report(
-            y_test,
-            y_pred_xgb,
+            y_test, y_pred_xgb,
             labels=label_indices,
             target_names=class_names,
             zero_division=0,
@@ -374,13 +409,14 @@ def main():
     )
 
     plot_confusion_matrix(
-        y_test, y_pred_xgb, class_names, DATA_DIR / "cm_xgboost.png", labels=label_indices
+        y_test, y_pred_xgb, class_names, DATA_DIR / "cm_xgboost.png",
+        labels=label_indices,
     )
     plot_feature_importance(xgb, avail_features, DATA_DIR / "feature_importance.png")
     plot_shap(xgb, X_train, avail_features, DATA_DIR / "shap_summary.png")
     plot_shap_per_class(xgb, X_train, avail_features, class_names, DATA_DIR)
 
-    # ── Random Forest (comparison) ────────────────────────────────────────
+    # ── Random Forest (comparison) ──────────────────────────────────────────
     print("\n[Random Forest] Training ...")
     rf = RandomForestClassifier(n_estimators=200, max_depth=6, random_state=42, n_jobs=-1)
     rf.fit(X_train, y_train)
@@ -392,8 +428,7 @@ def main():
     print(f"  F1 macro (Random Forest): {f1_rf:.4f}")
     print(
         classification_report(
-            y_test,
-            y_pred_rf,
+            y_test, y_pred_rf,
             labels=label_indices,
             target_names=class_names,
             zero_division=0,
@@ -401,10 +436,11 @@ def main():
     )
 
     plot_confusion_matrix(
-        y_test, y_pred_rf, class_names, DATA_DIR / "cm_randomforest.png", labels=label_indices
+        y_test, y_pred_rf, class_names, DATA_DIR / "cm_randomforest.png",
+        labels=label_indices,
     )
 
-    # ── Summary ──────────────────────────────────────────────────────────
+    # ── Summary ─────────────────────────────────────────────────────────────
     print("\n=== Model Comparison ===")
     print(f"  XGBoost   F1-macro (test): {f1_xgb:.4f}")
     print(f"  XGBoost   F1-macro (CV):   {cv_scores.mean():.4f} +/- {cv_scores.std():.4f}")
@@ -415,12 +451,12 @@ def main():
     if f1_xgb >= 0.65:
         print("  Classification quality: GOOD (F1 >= 0.65)")
     elif f1_xgb >= 0.40:
-        print("  Classification quality: FAIR — collect more/better-labelled data")
+        print("  Classification quality: FAIR — collect more data")
     else:
         print("  Classification quality: WEAK — need more diverse training samples")
 
-    # ── Save ─────────────────────────────────────────────────────────────
-    save_model(xgb, rf, scaler, le, avail_features, MODEL_PKL)
+    # ── Save ────────────────────────────────────────────────────────────────
+    save_model(xgb, rf, scaler, CLUSTER_NAMES, avail_features, MODEL_PKL)
 
 
 if __name__ == "__main__":
