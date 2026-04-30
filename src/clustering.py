@@ -87,8 +87,10 @@ def load_and_prepare(csv_path: Path, labeled_csv: Path | None = None) -> tuple[p
             df_feat[col] = np.log1p(df_feat[col].clip(lower=0))
 
     if "net_flow_eth" in df_feat.columns:
-        nf = df_feat["net_flow_eth"]
-        df_feat["net_flow_eth"] = np.sign(nf) * np.log1p(nf.abs())
+        # Rank-based transform: maps to [0, 1] percentiles.
+        # Avoids the bimodal split that sign*log1p creates, which causes
+        # KMeans to form clusters purely by flow direction.
+        df_feat["net_flow_eth"] = df_feat["net_flow_eth"].rank(pct=True)
 
     scaler = RobustScaler()
     X = scaler.fit_transform(df_feat.values)
@@ -98,9 +100,10 @@ def load_and_prepare(csv_path: Path, labeled_csv: Path | None = None) -> tuple[p
 def find_best_k(X: np.ndarray, k_range=range(2, 9), preferred_k: int = 4) -> int:
     """Return k with the highest silhouette score.
 
-    If *preferred_k* has a silhouette within 20% of the best, choose it
-    instead — more clusters often yield more interpretable behavioural
-    profiles even at a small silhouette cost.
+    If *preferred_k* has a silhouette >= 0.25 (acceptable clustering quality),
+    choose it regardless of the gap to the best k — richer segmentation is
+    more valuable for behavioural profiling than a marginally higher
+    silhouette with fewer clusters.
     """
     scores = {}
     for k in k_range:
@@ -114,14 +117,14 @@ def find_best_k(X: np.ndarray, k_range=range(2, 9), preferred_k: int = 4) -> int
     best_k = max(scores, key=scores.get)
     best_sil = scores[best_k]
 
-    # Prefer a richer segmentation when the quality cost is small
+    # Prefer richer segmentation if quality is still acceptable
     if preferred_k in scores and preferred_k != best_k:
         pref_sil = scores[preferred_k]
-        gap = (best_sil - pref_sil) / (best_sil + 1e-9)
-        if gap <= 0.20:
+        if pref_sil >= 0.25:
+            gap = (best_sil - pref_sil) / (best_sil + 1e-9)
             print(f"Best silhouette at k={best_k} ({best_sil:.3f}), but k={preferred_k} "
-                  f"({pref_sil:.3f}) is within {gap*100:.1f}% — choosing k={preferred_k} "
-                  f"for richer segmentation")
+                  f"({pref_sil:.3f}, gap={gap*100:.1f}%) still has acceptable quality "
+                  f"— choosing k={preferred_k} for richer segmentation")
             return preferred_k
 
     print(f"Best k = {best_k}  (silhouette={best_sil:.3f})")
