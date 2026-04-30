@@ -46,7 +46,7 @@ except ImportError:
     SHAP_AVAILABLE = False
     print("shap not installed — SHAP plot will be skipped.")
 
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(__file__).parent / "data_new"
 MODELS_DIR = Path(__file__).parent / "models"
 MODELS_DIR.mkdir(exist_ok=True)
 

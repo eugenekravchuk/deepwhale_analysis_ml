@@ -13,7 +13,7 @@ import pandas as pd
 from pathlib import Path
 from scipy.stats import entropy as scipy_entropy
 
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(__file__).parent / "data_new"
 RAW_CSV = DATA_DIR / "raw_whale_transactions.csv"
 FEATURES_CSV = DATA_DIR / "address_features.csv"
 KNOWN_CSV = DATA_DIR / "known_addresses.csv"

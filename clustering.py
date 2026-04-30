@@ -36,7 +36,7 @@ from sklearn.neighbors import NearestNeighbors
 
 warnings.filterwarnings("ignore")
 
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(__file__).parent / "data_new"
 FEATURES_CSV = DATA_DIR / "address_features.csv"
 LABELED_CSV = DATA_DIR / "labeled_addresses.csv"
 OUTPUT_CSV = DATA_DIR / "clustered_addresses.csv"

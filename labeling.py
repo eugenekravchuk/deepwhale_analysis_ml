@@ -21,7 +21,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(__file__).parent / "data_new"
 FEATURES_CSV = DATA_DIR / "address_features.csv"
 KNOWN_CSV = DATA_DIR / "known_addresses.csv"
 LABELED_CSV = DATA_DIR / "labeled_addresses.csv"
