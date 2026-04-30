@@ -52,13 +52,6 @@ except ImportError:
     SHAP_AVAILABLE = False
     print("shap not installed — SHAP plots will be skipped.")
 
-DATA_DIR = Path(__file__).parent / "data"
-MODELS_DIR = Path(__file__).parent / "models"
-MODELS_DIR.mkdir(exist_ok=True)
-
-CLUSTERED_CSV = DATA_DIR / "clustered_addresses.csv"
-MODEL_PKL = MODELS_DIR / "whale_classifier.pkl"
-
 FEATURE_COLS = [
     "tx_count_out",
     "total_eth_out",
@@ -355,13 +348,18 @@ def save_model(xgb_model, rf_model, scaler, cluster_names, feature_names, path: 
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
-def main():
-    if not CLUSTERED_CSV.exists():
-        raise FileNotFoundError(
-            f"{CLUSTERED_CSV} not found. Run clustering.py first."
-        )
+def run(clustered_csv, model_pkl, figures_dir) -> dict:
+    """Module entry point: train classifiers and save model bundle."""
+    clustered_csv = Path(clustered_csv)
+    model_pkl = Path(model_pkl)
+    figures_dir = Path(figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    model_pkl.parent.mkdir(parents=True, exist_ok=True)
 
-    train_df, test_df = load_data(CLUSTERED_CSV)
+    if not clustered_csv.exists():
+        raise FileNotFoundError(f"{clustered_csv} not found. Run clustering first.")
+
+    train_df, test_df = load_data(clustered_csv)
 
     n_classes = train_df[TARGET_COL].nunique()
     class_names = [CLUSTER_NAMES.get(i, f"Cluster {i}") for i in range(n_classes)]
@@ -409,12 +407,12 @@ def main():
     )
 
     plot_confusion_matrix(
-        y_test, y_pred_xgb, class_names, DATA_DIR / "cm_xgboost.png",
+        y_test, y_pred_xgb, class_names, figures_dir / "cm_xgboost.png",
         labels=label_indices,
     )
-    plot_feature_importance(xgb, avail_features, DATA_DIR / "feature_importance.png")
-    plot_shap(xgb, X_train, avail_features, DATA_DIR / "shap_summary.png")
-    plot_shap_per_class(xgb, X_train, avail_features, class_names, DATA_DIR)
+    plot_feature_importance(xgb, avail_features, figures_dir / "feature_importance.png")
+    plot_shap(xgb, X_train, avail_features, figures_dir / "shap_summary.png")
+    plot_shap_per_class(xgb, X_train, avail_features, class_names, figures_dir)
 
     # ── Random Forest (comparison) ──────────────────────────────────────────
     print("\n[Random Forest] Training ...")
@@ -436,7 +434,7 @@ def main():
     )
 
     plot_confusion_matrix(
-        y_test, y_pred_rf, class_names, DATA_DIR / "cm_randomforest.png",
+        y_test, y_pred_rf, class_names, figures_dir / "cm_randomforest.png",
         labels=label_indices,
     )
 
@@ -456,8 +454,14 @@ def main():
         print("  Classification quality: WEAK — need more diverse training samples")
 
     # ── Save ────────────────────────────────────────────────────────────────
-    save_model(xgb, rf, scaler, CLUSTER_NAMES, avail_features, MODEL_PKL)
+    save_model(xgb, rf, scaler, CLUSTER_NAMES, avail_features, model_pkl)
+    return {"f1_xgb": f1_xgb, "f1_rf": f1_rf, "cv_mean": cv_scores.mean()}
 
 
 if __name__ == "__main__":
-    main()
+    _root = Path(__file__).parent.parent
+    run(
+        clustered_csv=_root / "data" / "clustered_addresses.csv",
+        model_pkl=_root / "models" / "whale_classifier.pkl",
+        figures_dir=_root / "data",
+    )

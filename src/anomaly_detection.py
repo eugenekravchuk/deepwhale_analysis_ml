@@ -43,13 +43,6 @@ from scipy.spatial.distance import mahalanobis
 
 warnings.filterwarnings("ignore")
 
-DATA_DIR = Path(__file__).parent / "data"
-FEATURES_CSV = DATA_DIR / "address_features.csv"
-LABELED_CSV = DATA_DIR / "labeled_addresses.csv"
-CLUSTERED_CSV = DATA_DIR / "clustered_addresses.csv"
-RAW_CSV = DATA_DIR / "raw_whale_transactions.csv"
-ANOMALY_CSV = DATA_DIR / "anomaly_scores.csv"
-
 FEATURE_COLS = [
     "tx_count_out",
     "total_eth_out",
@@ -97,14 +90,17 @@ def log_transform(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_address_features() -> pd.DataFrame:
+def load_address_features(features_csv, labeled_csv=None, clustered_csv=None):
     """Load the best available feature source."""
-    if CLUSTERED_CSV.exists():
-        source = CLUSTERED_CSV
-    elif LABELED_CSV.exists():
-        source = LABELED_CSV
+    _clustered = Path(clustered_csv) if clustered_csv else None
+    _labeled = Path(labeled_csv) if labeled_csv else None
+    _features = Path(features_csv)
+    if _clustered and _clustered.exists():
+        source = _clustered
+    elif _labeled and _labeled.exists():
+        source = _labeled
     else:
-        source = FEATURES_CSV
+        source = _features
     df = pd.read_csv(source)
     for col in FEATURE_COLS:
         if col in df.columns and df[col].isna().any():
@@ -444,14 +440,21 @@ def print_top_anomalies(df: pd.DataFrame, n: int = 10):
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
-def main():
-    if not FEATURES_CSV.exists() and not CLUSTERED_CSV.exists():
+def run(features_csv, anomaly_csv, figures_dir, raw_csv=None, clustered_csv=None, labeled_csv=None) -> pd.DataFrame:
+    """Module entry point: detect anomalous whale addresses."""
+    features_csv = Path(features_csv)
+    anomaly_csv = Path(anomaly_csv)
+    figures_dir = Path(figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    anomaly_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    if not features_csv.exists() and not (clustered_csv and Path(clustered_csv).exists()):
         raise FileNotFoundError(
-            "No feature data found. Run feature_engineering.py or clustering.py first."
+            "No feature data found. Run feature_engineering or clustering first."
         )
 
     print("Loading address features ...")
-    df, source = load_address_features()
+    df, source = load_address_features(features_csv, labeled_csv=labeled_csv, clustered_csv=clustered_csv)
     print(f"  {len(df)} addresses from {source}")
     has_clusters = "kmeans_cluster" in df.columns
 
@@ -470,7 +473,7 @@ def main():
         print("\n[Layer 2] Intra-cluster Mahalanobis distance ...")
         df = detect_cluster_anomalies(df, X_scaled, threshold_percentile=95)
     else:
-        print("\n[Layer 2] Skipped — no cluster labels found. Run clustering.py first.")
+        print("\n[Layer 2] Skipped — no cluster labels found. Run clustering first.")
 
     # Combine both layers
     print("\n[Combining anomaly layers]")
@@ -481,27 +484,36 @@ def main():
     df = compute_feature_contributions(df, X_scaled, avail)
 
     # Plots
-    plot_anomaly_score_distribution(df, DATA_DIR / "anomaly_scores_plot.png")
+    plot_anomaly_score_distribution(df, figures_dir / "anomaly_scores_plot.png")
     if has_clusters:
-        plot_anomaly_by_cluster(df, DATA_DIR / "anomaly_by_cluster.png")
+        plot_anomaly_by_cluster(df, figures_dir / "anomaly_by_cluster.png")
 
     print_top_anomalies(df)
 
     # Save
-    df.to_csv(ANOMALY_CSV, index=False)
-    print(f"\nSaved anomaly scores to {ANOMALY_CSV}")
+    df.to_csv(anomaly_csv, index=False)
+    print(f"\nSaved anomaly scores to {anomaly_csv}")
 
     # Timeline analysis
-    if RAW_CSV.exists():
+    if raw_csv and Path(raw_csv).exists():
         print("\n[Timeline] Building anomaly-vs-price timeline ...")
-        raw_df = pd.read_csv(RAW_CSV)
+        raw_df = pd.read_csv(raw_csv)
         anomalous_addresses = set(df[df["anomaly_label"] == -1]["address"])
         timeline = build_timeline(raw_df, anomalous_addresses)
-        plot_anomaly_timeline(timeline, DATA_DIR / "anomaly_timeline.png")
+        plot_anomaly_timeline(timeline, figures_dir / "anomaly_timeline.png")
         compute_price_correlation(timeline)
     else:
         print("raw_whale_transactions.csv not found — skipping timeline analysis.")
+    return df
 
 
 if __name__ == "__main__":
-    main()
+    _root = Path(__file__).parent.parent
+    run(
+        features_csv=_root / "data" / "address_features.csv",
+        anomaly_csv=_root / "data" / "anomaly_scores.csv",
+        figures_dir=_root / "data",
+        raw_csv=_root / "data" / "raw_whale_transactions.csv",
+        clustered_csv=_root / "data" / "clustered_addresses.csv",
+        labeled_csv=_root / "data" / "labeled_addresses.csv",
+    )

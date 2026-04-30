@@ -36,11 +36,6 @@ from sklearn.neighbors import NearestNeighbors
 
 warnings.filterwarnings("ignore")
 
-DATA_DIR = Path(__file__).parent / "data_new"
-FEATURES_CSV = DATA_DIR / "address_features.csv"
-LABELED_CSV = DATA_DIR / "labeled_addresses.csv"
-OUTPUT_CSV = DATA_DIR / "clustered_addresses.csv"
-
 FEATURE_COLS = [
     "tx_count_out",
     "total_eth_out",
@@ -71,9 +66,9 @@ CLUSTER_NAMES = {
 }
 
 
-def load_and_prepare(csv_path: Path) -> tuple[pd.DataFrame, np.ndarray, RobustScaler]:
+def load_and_prepare(csv_path: Path, labeled_csv: Path | None = None) -> tuple[pd.DataFrame, np.ndarray, RobustScaler]:
     """Load features, impute NaNs, log-transform heavy-tailed columns, then scale."""
-    source = LABELED_CSV if LABELED_CSV.exists() else csv_path
+    source = labeled_csv if (labeled_csv and labeled_csv.exists()) else csv_path
     df = pd.read_csv(source)
     print(f"Loaded {len(df)} addresses from {source.name}")
 
@@ -317,17 +312,25 @@ def print_cluster_profiles(df: pd.DataFrame, cluster_col: str):
     print(df[cluster_col].value_counts().sort_index().to_string())
 
 
-def main():
-    if not FEATURES_CSV.exists():
-        raise FileNotFoundError(f"{FEATURES_CSV} not found. Run feature_engineering.py first.")
+def run(features_csv, output_csv, figures_dir, labeled_csv=None) -> pd.DataFrame:
+    """Module entry point: cluster whale addresses and save results."""
+    features_csv = Path(features_csv)
+    output_csv = Path(output_csv)
+    figures_dir = Path(figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    labeled = Path(labeled_csv) if labeled_csv else None
 
-    df, X, scaler = load_and_prepare(FEATURES_CSV)
+    if not features_csv.exists() and not (labeled and labeled.exists()):
+        raise FileNotFoundError(f"{features_csv} not found. Run feature_engineering first.")
+
+    df, X, scaler = load_and_prepare(features_csv, labeled_csv=labeled)
 
     if len(df) < 4:
         print("Too few addresses for clustering (need ≥ 4). Collect more data first.")
-        return
+        return df
 
-    # ── KMeans ──────────────────────────────────────────────────────────────
+    # ── KMeans ──────────────────────────────────────────────────────────────────────
     print("\n[KMeans] Finding best k ...")
     best_k = find_best_k(X, k_range=range(2, min(9, len(df))))
     km_labels = run_kmeans(X, best_k)
@@ -337,21 +340,21 @@ def main():
 
     print("\n[PCA] Plotting KMeans clusters ...")
     plot_pca(X, km_labels, f"KMeans Clusters (k={best_k}) — PCA projection",
-             DATA_DIR / "cluster_pca_kmeans.png", label_names)
+             figures_dir / "cluster_pca_kmeans.png", label_names)
 
     if len(df) >= 10:
         print("[t-SNE] Plotting KMeans clusters (may take a moment) ...")
         plot_tsne(X, km_labels, f"KMeans Clusters (k={best_k}) — t-SNE projection",
-                  DATA_DIR / "cluster_tsne_kmeans.png", label_names)
+                  figures_dir / "cluster_tsne_kmeans.png", label_names)
 
     print("[Radar] Plotting cluster behaviour profiles ...")
-    plot_radar(df, "kmeans_cluster", DATA_DIR / "cluster_radar.png")
+    plot_radar(df, "kmeans_cluster", figures_dir / "cluster_radar.png")
 
     print_cluster_profiles(df, "kmeans_cluster")
 
-    # ── DBSCAN ──────────────────────────────────────────────────────────────
+    # ── DBSCAN ──────────────────────────────────────────────────────────────────
     print("\n[DBSCAN] Auto-tuning eps via k-distance kneedle ...")
-    optimal_eps = find_optimal_eps(X, min_samples=5, out_path=DATA_DIR / "cluster_kdistance.png")
+    optimal_eps = find_optimal_eps(X, min_samples=5, out_path=figures_dir / "cluster_kdistance.png")
     print(f"\n[DBSCAN] Detecting noise / outlier whales (eps={optimal_eps:.3f}, min_samples=5) ...")
     db_labels = run_dbscan(X, eps=optimal_eps, min_samples=5)
     df["dbscan_cluster"] = db_labels
@@ -362,11 +365,11 @@ def main():
     db_label_names = {k: f"DBSCAN-{k}" for k in set(db_labels) if k != -1}
     db_label_names[-1] = "Outlier Whale"
     plot_pca(X, db_labels, "DBSCAN Clusters — PCA projection",
-             DATA_DIR / "cluster_pca_dbscan.png", db_label_names)
+             figures_dir / "cluster_pca_dbscan.png", db_label_names)
 
-    # ── Save ────────────────────────────────────────────────────────────────
-    df.to_csv(OUTPUT_CSV, index=False)
-    print(f"\nSaved clustered data to {OUTPUT_CSV}")
+    # ── Save ─────────────────────────────────────────────────────────────────────
+    df.to_csv(output_csv, index=False)
+    print(f"\nSaved clustered data to {output_csv}")
 
     sil = silhouette_score(X, km_labels)
     print(f"\nFinal silhouette score (KMeans k={best_k}): {sil:.4f}")
@@ -376,7 +379,14 @@ def main():
         print("  Clustering quality: FAIR — consider collecting more data")
     else:
         print("  Clustering quality: WEAK — collect significantly more data")
+    return df
 
 
 if __name__ == "__main__":
-    main()
+    _root = Path(__file__).parent.parent
+    run(
+        features_csv=_root / "data" / "address_features.csv",
+        output_csv=_root / "data" / "clustered_addresses.csv",
+        figures_dir=_root / "data",
+        labeled_csv=_root / "data" / "labeled_addresses.csv",
+    )
