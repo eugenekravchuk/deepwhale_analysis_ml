@@ -21,11 +21,6 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-DATA_DIR = Path(__file__).parent / "data"
-FEATURES_CSV = DATA_DIR / "address_features.csv"
-KNOWN_CSV = DATA_DIR / "known_addresses.csv"
-LABELED_CSV = DATA_DIR / "labeled_addresses.csv"
-
 # ── Thresholds (tunable) ────────────────────────────────────────────────────
 EXCHANGE_RATIO_THRESHOLD = 0.50      # >50 % volume flows to known exchanges
 ACCUMULATOR_NET_FLOW_MIN = 0.0       # net ETH inflow ≥ 0
@@ -112,24 +107,20 @@ def print_label_summary(df: pd.DataFrame):
     print()
 
 
-def main():
-    if not FEATURES_CSV.exists():
-        raise FileNotFoundError(
-            f"{FEATURES_CSV} not found. Run feature_engineering.py first."
-        )
-
-    print(f"Loading features from {FEATURES_CSV} ...")
-    df = pd.read_csv(FEATURES_CSV)
+def run(features_csv, labeled_csv) -> pd.DataFrame:
+    """Module entry point: assign heuristic labels to address features."""
+    features_csv = Path(features_csv)
+    labeled_csv = Path(labeled_csv)
+    if not features_csv.exists():
+        raise FileNotFoundError(f"{features_csv} not found. Run feature_engineering first.")
+    print(f"Loading features from {features_csv} ...")
+    df = pd.read_csv(features_csv)
     print(f"  {len(df)} addresses")
-
     df = label_dataframe(df)
-
     print_label_summary(df)
-
-    df.to_csv(LABELED_CSV, index=False)
-    print(f"Saved labeled data to {LABELED_CSV}")
-
-    # Print a few examples per class
+    labeled_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(labeled_csv, index=False)
+    print(f"Saved labeled data to {labeled_csv}")
     for lbl in df["label"].unique():
         sample = df[df["label"] == lbl].head(2)[
             ["address", "tx_count_out", "exchange_ratio", "active_days",
@@ -137,7 +128,12 @@ def main():
         ]
         print(f"\n--- {lbl} (sample) ---")
         print(sample.to_string(index=False))
+    return df
 
 
 if __name__ == "__main__":
-    main()
+    _root = Path(__file__).parent.parent
+    run(
+        features_csv=_root / "data" / "address_features.csv",
+        labeled_csv=_root / "data" / "labeled_addresses.csv",
+    )

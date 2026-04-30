@@ -36,11 +36,6 @@ from sklearn.neighbors import NearestNeighbors
 
 warnings.filterwarnings("ignore")
 
-DATA_DIR = Path(__file__).parent / "data_new"
-FEATURES_CSV = DATA_DIR / "address_features.csv"
-LABELED_CSV = DATA_DIR / "labeled_addresses.csv"
-OUTPUT_CSV = DATA_DIR / "clustered_addresses.csv"
-
 FEATURE_COLS = [
     "tx_count_out",
     "total_eth_out",
@@ -56,7 +51,6 @@ FEATURE_COLS = [
     "gas_variability",
     "hour_entropy",
     "active_days",
-    "net_flow_eth",
 ]
 
 CLUSTER_PALETTE = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c"]
@@ -71,10 +65,11 @@ CLUSTER_NAMES = {
 }
 
 
-def load_and_prepare(csv_path: Path) -> tuple[pd.DataFrame, np.ndarray, RobustScaler]:
+def load_and_prepare(csv_path: Path, labeled_csv: Path | None = None) -> tuple[pd.DataFrame, np.ndarray, RobustScaler]:
     """Load features, impute NaNs, log-transform heavy-tailed columns, then scale."""
-    source = LABELED_CSV if LABELED_CSV.exists() else csv_path
+    source = labeled_csv if (labeled_csv and labeled_csv.exists()) else csv_path
     df = pd.read_csv(source)
+    df = df.drop(columns=['net_flow_eth'], errors='ignore')
     print(f"Loaded {len(df)} addresses from {source.name}")
 
     df_feat = df[FEATURE_COLS].copy()
@@ -91,10 +86,6 @@ def load_and_prepare(csv_path: Path) -> tuple[pd.DataFrame, np.ndarray, RobustSc
         if col in df_feat.columns:
             df_feat[col] = np.log1p(df_feat[col].clip(lower=0))
 
-    if "net_flow_eth" in df_feat.columns:
-        nf = df_feat["net_flow_eth"]
-        df_feat["net_flow_eth"] = np.sign(nf) * np.log1p(nf.abs())
-
     scaler = RobustScaler()
     X = scaler.fit_transform(df_feat.values)
     return df, X, scaler
@@ -103,9 +94,10 @@ def load_and_prepare(csv_path: Path) -> tuple[pd.DataFrame, np.ndarray, RobustSc
 def find_best_k(X: np.ndarray, k_range=range(2, 9), preferred_k: int = 4) -> int:
     """Return k with the highest silhouette score.
 
-    If *preferred_k* has a silhouette within 20% of the best, choose it
-    instead — more clusters often yield more interpretable behavioural
-    profiles even at a small silhouette cost.
+    If *preferred_k* has a silhouette >= 0.25 (acceptable clustering quality),
+    choose it regardless of the gap to the best k — richer segmentation is
+    more valuable for behavioural profiling than a marginally higher
+    silhouette with fewer clusters.
     """
     scores = {}
     for k in k_range:
@@ -119,14 +111,14 @@ def find_best_k(X: np.ndarray, k_range=range(2, 9), preferred_k: int = 4) -> int
     best_k = max(scores, key=scores.get)
     best_sil = scores[best_k]
 
-    # Prefer a richer segmentation when the quality cost is small
+    # Prefer richer segmentation if quality is still acceptable
     if preferred_k in scores and preferred_k != best_k:
         pref_sil = scores[preferred_k]
-        gap = (best_sil - pref_sil) / (best_sil + 1e-9)
-        if gap <= 0.20:
+        if pref_sil >= 0.25:
+            gap = (best_sil - pref_sil) / (best_sil + 1e-9)
             print(f"Best silhouette at k={best_k} ({best_sil:.3f}), but k={preferred_k} "
-                  f"({pref_sil:.3f}) is within {gap*100:.1f}% — choosing k={preferred_k} "
-                  f"for richer segmentation")
+                  f"({pref_sil:.3f}, gap={gap*100:.1f}%) still has acceptable quality "
+                  f"— choosing k={preferred_k} for richer segmentation")
             return preferred_k
 
     print(f"Best k = {best_k}  (silhouette={best_sil:.3f})")
@@ -308,7 +300,7 @@ def plot_radar(df: pd.DataFrame, cluster_col: str, out_path: Path):
 def print_cluster_profiles(df: pd.DataFrame, cluster_col: str):
     profile_cols = [
         "tx_count_out", "total_eth_out", "avg_tx_eth", "unique_receivers",
-        "exchange_ratio", "round_number_ratio", "active_days", "net_flow_eth",
+        "exchange_ratio", "round_number_ratio", "active_days",
     ]
     avail = [c for c in profile_cols if c in df.columns]
     print("\n=== Cluster Profiles (medians) ===")
@@ -317,17 +309,25 @@ def print_cluster_profiles(df: pd.DataFrame, cluster_col: str):
     print(df[cluster_col].value_counts().sort_index().to_string())
 
 
-def main():
-    if not FEATURES_CSV.exists():
-        raise FileNotFoundError(f"{FEATURES_CSV} not found. Run feature_engineering.py first.")
+def run(features_csv, output_csv, figures_dir, labeled_csv=None) -> pd.DataFrame:
+    """Module entry point: cluster whale addresses and save results."""
+    features_csv = Path(features_csv)
+    output_csv = Path(output_csv)
+    figures_dir = Path(figures_dir)
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    labeled = Path(labeled_csv) if labeled_csv else None
 
-    df, X, scaler = load_and_prepare(FEATURES_CSV)
+    if not features_csv.exists() and not (labeled and labeled.exists()):
+        raise FileNotFoundError(f"{features_csv} not found. Run feature_engineering first.")
+
+    df, X, scaler = load_and_prepare(features_csv, labeled_csv=labeled)
 
     if len(df) < 4:
         print("Too few addresses for clustering (need ≥ 4). Collect more data first.")
-        return
+        return df
 
-    # ── KMeans ──────────────────────────────────────────────────────────────
+    # ── KMeans ──────────────────────────────────────────────────────────────────────
     print("\n[KMeans] Finding best k ...")
     best_k = find_best_k(X, k_range=range(2, min(9, len(df))))
     km_labels = run_kmeans(X, best_k)
@@ -337,21 +337,21 @@ def main():
 
     print("\n[PCA] Plotting KMeans clusters ...")
     plot_pca(X, km_labels, f"KMeans Clusters (k={best_k}) — PCA projection",
-             DATA_DIR / "cluster_pca_kmeans.png", label_names)
+             figures_dir / "cluster_pca_kmeans.png", label_names)
 
     if len(df) >= 10:
         print("[t-SNE] Plotting KMeans clusters (may take a moment) ...")
         plot_tsne(X, km_labels, f"KMeans Clusters (k={best_k}) — t-SNE projection",
-                  DATA_DIR / "cluster_tsne_kmeans.png", label_names)
+                  figures_dir / "cluster_tsne_kmeans.png", label_names)
 
     print("[Radar] Plotting cluster behaviour profiles ...")
-    plot_radar(df, "kmeans_cluster", DATA_DIR / "cluster_radar.png")
+    plot_radar(df, "kmeans_cluster", figures_dir / "cluster_radar.png")
 
     print_cluster_profiles(df, "kmeans_cluster")
 
-    # ── DBSCAN ──────────────────────────────────────────────────────────────
+    # ── DBSCAN ──────────────────────────────────────────────────────────────────
     print("\n[DBSCAN] Auto-tuning eps via k-distance kneedle ...")
-    optimal_eps = find_optimal_eps(X, min_samples=5, out_path=DATA_DIR / "cluster_kdistance.png")
+    optimal_eps = find_optimal_eps(X, min_samples=5, out_path=figures_dir / "cluster_kdistance.png")
     print(f"\n[DBSCAN] Detecting noise / outlier whales (eps={optimal_eps:.3f}, min_samples=5) ...")
     db_labels = run_dbscan(X, eps=optimal_eps, min_samples=5)
     df["dbscan_cluster"] = db_labels
@@ -362,11 +362,11 @@ def main():
     db_label_names = {k: f"DBSCAN-{k}" for k in set(db_labels) if k != -1}
     db_label_names[-1] = "Outlier Whale"
     plot_pca(X, db_labels, "DBSCAN Clusters — PCA projection",
-             DATA_DIR / "cluster_pca_dbscan.png", db_label_names)
+             figures_dir / "cluster_pca_dbscan.png", db_label_names)
 
-    # ── Save ────────────────────────────────────────────────────────────────
-    df.to_csv(OUTPUT_CSV, index=False)
-    print(f"\nSaved clustered data to {OUTPUT_CSV}")
+    # ── Save ─────────────────────────────────────────────────────────────────────
+    df.to_csv(output_csv, index=False)
+    print(f"\nSaved clustered data to {output_csv}")
 
     sil = silhouette_score(X, km_labels)
     print(f"\nFinal silhouette score (KMeans k={best_k}): {sil:.4f}")
@@ -376,7 +376,14 @@ def main():
         print("  Clustering quality: FAIR — consider collecting more data")
     else:
         print("  Clustering quality: WEAK — collect significantly more data")
+    return df
 
 
 if __name__ == "__main__":
-    main()
+    _root = Path(__file__).parent.parent
+    run(
+        features_csv=_root / "data" / "address_features.csv",
+        output_csv=_root / "data" / "clustered_addresses.csv",
+        figures_dir=_root / "data",
+        labeled_csv=_root / "data" / "labeled_addresses.csv",
+    )

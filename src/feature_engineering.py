@@ -13,11 +13,6 @@ import pandas as pd
 from pathlib import Path
 from scipy.stats import entropy as scipy_entropy
 
-DATA_DIR = Path(__file__).parent / "data"
-RAW_CSV = DATA_DIR / "raw_whale_transactions.csv"
-FEATURES_CSV = DATA_DIR / "address_features.csv"
-KNOWN_CSV = DATA_DIR / "known_addresses.csv"
-
 WINDOW_DAYS = 30
 ROUND_ETH_VALUES = {10, 20, 25, 30, 50, 75, 100, 150, 200, 250, 500, 1000}
 
@@ -144,27 +139,31 @@ def build_address_features(df_raw: pd.DataFrame, exchange_set: set[str]) -> pd.D
     return pd.DataFrame(records)
 
 
-def main():
-    if not RAW_CSV.exists():
-        raise FileNotFoundError(
-            f"{RAW_CSV} not found. Run data_collection.py first."
-        )
-
-    print(f"Loading {RAW_CSV} ...")
-    df_raw = pd.read_csv(RAW_CSV)
+def run(raw_csv, features_csv, known_csv=None) -> pd.DataFrame:
+    """Module entry point: build per-address features from raw transactions."""
+    raw_csv = Path(raw_csv)
+    features_csv = Path(features_csv)
+    if not raw_csv.exists():
+        raise FileNotFoundError(f"{raw_csv} not found. Run data_collection first.")
+    print(f"Loading {raw_csv} ...")
+    df_raw = pd.read_csv(raw_csv)
     print(f"  {len(df_raw)} raw transactions, {df_raw['from_address'].nunique()} unique senders")
-
-    exchange_set = load_known_exchanges(KNOWN_CSV)
+    exchange_set = load_known_exchanges(Path(known_csv)) if known_csv else set()
     print(f"  Loaded {len(exchange_set)} known exchange addresses")
-
     print("Building address features ...")
     df_features = build_address_features(df_raw, exchange_set)
     print(f"  {len(df_features)} addresses with features")
-
-    df_features.to_csv(FEATURES_CSV, index=False)
-    print(f"Saved to {FEATURES_CSV}")
+    features_csv.parent.mkdir(parents=True, exist_ok=True)
+    df_features.to_csv(features_csv, index=False)
+    print(f"Saved to {features_csv}")
     print(df_features.describe().to_string())
+    return df_features
 
 
 if __name__ == "__main__":
-    main()
+    _root = Path(__file__).parent.parent
+    run(
+        raw_csv=_root / "data" / "raw_whale_transactions.csv",
+        features_csv=_root / "data" / "address_features.csv",
+        known_csv=_root / "data" / "known_addresses.csv",
+    )

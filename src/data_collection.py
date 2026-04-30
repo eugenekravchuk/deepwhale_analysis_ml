@@ -11,21 +11,18 @@ from pathlib import Path
 load_dotenv()
 ALCHEMY_URL = os.getenv("ALCHEMY_URL")
 
-DATA_DIR = Path(__file__).parent / "data"
-DATA_DIR.mkdir(exist_ok=True)
-OUTPUT_CSV = DATA_DIR / "raw_whale_transactions.csv"
-
-# Скільки останніх блоків зчитати (≈2.8 доби при ~12 с/блок; ~20k для довшого вікна)
 NUM_BLOCKS_DEFAULT = 20_000
-
 WHALE_THRESHOLD_ETH = 10
 
-w3 = Web3(Web3.HTTPProvider(ALCHEMY_URL))
 
-if not w3.is_connected():
-    raise ConnectionError("Cannot connect to Ethereum node. Check ALCHEMY_URL in .env")
-else:
+def connect_web3(alchemy_url: str | None = None):
+    """Create and verify a Web3 connection. Raises ConnectionError on failure."""
+    url = alchemy_url or os.getenv("ALCHEMY_URL")
+    _w3 = Web3(Web3.HTTPProvider(url))
+    if not _w3.is_connected():
+        raise ConnectionError("Cannot connect to Ethereum node. Check ALCHEMY_URL in .env")
     print("Connected to Ethereum")
+    return _w3
 
 
 def get_eth_price(timestamp: int, retries: int = 3, delay: float = 1.0) -> float | None:
@@ -53,9 +50,11 @@ def get_eth_price(timestamp: int, retries: int = 3, delay: float = 1.0) -> float
     return None
 
 
-def collect_whale_data(start_block: int, num_blocks: int = 500) -> pd.DataFrame:
+def collect_whale_data(start_block: int, num_blocks: int = 500, w3=None) -> pd.DataFrame:
     """Scan `num_blocks` blocks backwards from `start_block` and collect
     all ETH transfers larger than WHALE_THRESHOLD_ETH."""
+    if w3 is None:
+        w3 = connect_web3()
     transactions_data = []
     price_cache: dict[int, float | None] = {}
 
@@ -125,28 +124,31 @@ def append_or_create(new_df: pd.DataFrame, path: Path) -> pd.DataFrame:
     return new_df
 
 
+def run(output_csv, num_blocks: int = NUM_BLOCKS_DEFAULT, alchemy_url: str | None = None) -> pd.DataFrame:
+    """Module entry point: collect whale data and append to output_csv."""
+    output_csv = Path(output_csv)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    w3 = connect_web3(alchemy_url)
+    latest_block = w3.eth.block_number
+    print(f"Latest block: {latest_block}")
+    print(f"Collecting {num_blocks} blocks ({latest_block - num_blocks} → {latest_block}) ...")
+    df = collect_whale_data(latest_block, num_blocks=num_blocks, w3=w3)
+    if df.empty:
+        print("No whale transactions found in this range.")
+        return df
+    df_final = append_or_create(df, output_csv)
+    df_final.to_csv(output_csv, index=False)
+    print(f"\nDone. {len(df_final)} whale transactions saved to {output_csv}")
+    print(df_final[["timestamp", "from_address", "value_eth", "value_usd"]].tail(5).to_string())
+    return df_final
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collect large ETH transfers from recent blocks.")
     parser.add_argument(
-        "--blocks",
-        type=int,
-        default=NUM_BLOCKS_DEFAULT,
-        metavar="N",
+        "--blocks", type=int, default=NUM_BLOCKS_DEFAULT, metavar="N",
         help=f"How many recent blocks to scan (default: {NUM_BLOCKS_DEFAULT}).",
     )
+    parser.add_argument("--output", type=str, default="data/raw_whale_transactions.csv")
     args = parser.parse_args()
-    n = max(1, args.blocks)
-
-    latest_block = w3.eth.block_number
-    print(f"Latest block: {latest_block}")
-    print(f"Collecting {n} blocks ({latest_block - n} → {latest_block}) ...")
-
-    df_whales = collect_whale_data(latest_block, num_blocks=n)
-
-    if df_whales.empty:
-        print("No whale transactions found in this range.")
-    else:
-        df_final = append_or_create(df_whales, OUTPUT_CSV)
-        df_final.to_csv(OUTPUT_CSV, index=False)
-        print(f"\nDone. {len(df_final)} whale transactions saved to {OUTPUT_CSV}")
-        print(df_final[["timestamp", "from_address", "value_eth", "value_usd"]].tail(5).to_string())
+    run(output_csv=Path(args.output), num_blocks=max(1, args.blocks))
