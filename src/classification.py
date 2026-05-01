@@ -32,15 +32,17 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import RobustScaler, label_binarize
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
+    auc,
     classification_report,
     confusion_matrix,
     f1_score,
+    roc_curve,
     ConfusionMatrixDisplay,
 )
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV, learning_curve
 from xgboost import XGBClassifier
 
 warnings.filterwarnings("ignore")
@@ -119,8 +121,10 @@ def load_data(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     print(f"  Cluster distribution:\n{df[TARGET_COL].value_counts().sort_index().to_string()}")
 
-    # Time-based split: 80% earliest → train, 20% latest → test
-    if "first_seen" in df.columns:
+    # Sort by last_seen (most recent tx timestamp per address) for temporal split
+    if "last_seen" in df.columns:
+        df_sorted = df.sort_values("last_seen")
+    elif "first_seen" in df.columns:
         df_sorted = df.sort_values("first_seen")
     elif "block_number" in df.columns:
         df_sorted = df.sort_values("block_number")
@@ -303,11 +307,111 @@ def plot_shap_per_class(model, X_train: np.ndarray, feature_names: list[str],
     print(f"  Saved {out_path.name}")
 
 
+def plot_roc_auc(
+    model, X_test: np.ndarray, y_test: np.ndarray,
+    class_names: list[str], n_classes: int, out_path: Path,
+):
+    """One-vs-Rest ROC-AUC curves for each cluster + macro average."""
+    BG = "#0d1117"
+    PALETTE = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c"]
+
+    y_bin = label_binarize(y_test, classes=list(range(n_classes)))
+    y_prob = model.predict_proba(X_test)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.set_facecolor(BG)
+    fig.patch.set_facecolor(BG)
+
+    fpr_grid = np.linspace(0, 1, 300)
+    tpr_interp_sum = np.zeros(300)
+
+    for i, name in enumerate(class_names):
+        if y_bin[:, i].sum() == 0:
+            continue
+        fpr, tpr, _ = roc_curve(y_bin[:, i], y_prob[:, i])
+        roc_auc = auc(fpr, tpr)
+        ax.plot(fpr, tpr, color=PALETTE[i % len(PALETTE)], lw=2,
+                label=f"{name} (AUC = {roc_auc:.3f})")
+        tpr_interp_sum += np.interp(fpr_grid, fpr, tpr)
+
+    tpr_macro = tpr_interp_sum / n_classes
+    macro_auc = auc(fpr_grid, tpr_macro)
+    ax.plot(fpr_grid, tpr_macro, color="white", lw=2.5, linestyle="--",
+            label=f"Macro-avg (AUC = {macro_auc:.3f})")
+    ax.plot([0, 1], [0, 1], color="#555", linestyle=":", lw=1)
+
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1.02])
+    ax.set_xlabel("False Positive Rate", color="white")
+    ax.set_ylabel("True Positive Rate", color="white")
+    ax.set_title("ROC-AUC — Whale Cluster Classifier (One-vs-Rest)", color="white", fontsize=13)
+    ax.tick_params(colors="white")
+    ax.spines[:].set_color("#333")
+    leg = ax.legend(loc="lower right", framealpha=0.2, labelcolor="white")
+    leg.get_frame().set_facecolor("#1a1a2e")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"  Saved {out_path.name}")
+
+
+def plot_learning_curve(
+    model, X: np.ndarray, y: np.ndarray, out_path: Path,
+):
+    """Learning curve (training vs validation F1) to diagnose data sufficiency.
+
+    Uses TimeSeriesSplit so validation always follows training in time.
+    """
+    BG = "#0d1117"
+    train_sizes_abs, train_scores, val_scores = learning_curve(
+        model, X, y,
+        train_sizes=np.linspace(0.1, 1.0, 8),
+        cv=TimeSeriesSplit(n_splits=3),
+        scoring="f1_macro",
+        n_jobs=-1,
+    )
+
+    train_mean = train_scores.mean(axis=1)
+    train_std  = train_scores.std(axis=1)
+    val_mean   = val_scores.mean(axis=1)
+    val_std    = val_scores.std(axis=1)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.set_facecolor(BG)
+    fig.patch.set_facecolor(BG)
+
+    ax.plot(train_sizes_abs, train_mean, color="#3498db", lw=2, label="Training F1")
+    ax.fill_between(train_sizes_abs, train_mean - train_std, train_mean + train_std,
+                    alpha=0.15, color="#3498db")
+    ax.plot(train_sizes_abs, val_mean, color="#e74c3c", lw=2,
+            label="Validation F1 (TimeSeriesSplit)")
+    ax.fill_between(train_sizes_abs, val_mean - val_std, val_mean + val_std,
+                    alpha=0.15, color="#e74c3c")
+
+    ax.set_xlabel("Training set size (samples)", color="white")
+    ax.set_ylabel("F1 macro", color="white")
+    ax.set_title("Learning Curve — XGBoost Whale Cluster Classifier", color="white", fontsize=13)
+    ax.tick_params(colors="white")
+    ax.spines[:].set_color("#333")
+    ax.set_ylim([0, 1.05])
+    leg = ax.legend(loc="lower right", framealpha=0.2, labelcolor="white")
+    leg.get_frame().set_facecolor("#1a1a2e")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"  Saved {out_path.name}")
+
+
 # ── Cross-validation ────────────────────────────────────────────────────────
 
 def run_cross_validation(X: np.ndarray, y: np.ndarray, n_classes: int, n_splits: int = 5):
-    """StratifiedKFold CV on XGBoost for robust F1 macro estimate."""
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    """TimeSeriesSplit CV on XGBoost for temporal F1 macro estimate.
+
+    X must be time-sorted (earliest first) — ensured by load_data().
+    Each fold trains on a growing historical window and validates on the
+    immediately following time slice.
+    """
+    tss = TimeSeriesSplit(n_splits=n_splits)
     xgb_params = dict(
         n_estimators=200,
         max_depth=4,
@@ -321,14 +425,60 @@ def run_cross_validation(X: np.ndarray, y: np.ndarray, n_classes: int, n_splits:
         verbosity=0,
     )
 
-    cv_scores = cross_val_score(
-        XGBClassifier(**xgb_params), X, y,
-        cv=skf, scoring="f1_macro", n_jobs=-1,
-    )
-    print(f"\n[Cross-Validation] {n_splits}-fold Stratified CV (XGBoost)")
+    fold_scores = []
+    for train_idx, val_idx in tss.split(X):
+        X_tr, X_val = X[train_idx], X[val_idx]
+        y_tr, y_val = y[train_idx], y[val_idx]
+        if len(np.unique(y_tr)) < 2:
+            continue
+        model = XGBClassifier(**xgb_params)
+        model.fit(X_tr, y_tr, verbose=False)
+        y_pred = model.predict(X_val)
+        fold_scores.append(f1_score(y_val, y_pred, average="macro", zero_division=0))
+
+    cv_scores = np.array(fold_scores)
+    print(f"\n[Cross-Validation] {n_splits}-fold TimeSeriesSplit CV (XGBoost)")
     print(f"  Fold F1 scores: {[f'{s:.4f}' for s in cv_scores]}")
     print(f"  Mean F1 macro:  {cv_scores.mean():.4f} +/- {cv_scores.std():.4f}")
     return cv_scores
+
+
+# ── Hyperparameter tuning ──────────────────────────────────────────────────
+
+def tune_xgb_hyperparams(X: np.ndarray, y: np.ndarray, n_classes: int) -> dict:
+    """RandomizedSearchCV over max_depth and learning_rate (n_iter=5).
+
+    Uses TimeSeriesSplit so the search respects temporal ordering.
+    Returns best_params_ dict.
+    """
+    base = XGBClassifier(
+        n_estimators=200,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        eval_metric="mlogloss",
+        objective="multi:softprob",
+        num_class=n_classes,
+        random_state=42,
+        verbosity=0,
+    )
+    param_distributions = {
+        "max_depth": [3, 5, 7],
+        "learning_rate": [0.01, 0.1, 0.2],
+    }
+    search = RandomizedSearchCV(
+        base,
+        param_distributions=param_distributions,
+        n_iter=5,
+        scoring="f1_macro",
+        cv=TimeSeriesSplit(n_splits=3),
+        random_state=42,
+        n_jobs=-1,
+        refit=False,
+    )
+    search.fit(X, y)
+    print(f"  best_params_: {search.best_params_}")
+    print(f"  Best CV F1:   {search.best_score_:.4f}")
+    return search.best_params_
 
 
 # ── Model persistence ───────────────────────────────────────────────────────
@@ -376,12 +526,16 @@ def run(clustered_csv, model_pkl, figures_dir) -> dict:
     # ── Cross-Validation ────────────────────────────────────────────────────
     cv_scores = run_cross_validation(X_train, y_train, n_classes=n_classes)
 
+    # ── Hyperparameter Tuning ────────────────────────────────────────────────
+    print("\n[XGBoost] Tuning hyperparameters (RandomizedSearchCV, n_iter=5) ...")
+    best_hp = tune_xgb_hyperparams(X_train, y_train, n_classes=n_classes)
+
     # ── XGBoost ─────────────────────────────────────────────────────────────
     print("\n[XGBoost] Training ...")
     xgb_params = dict(
         n_estimators=200,
-        max_depth=4,
-        learning_rate=0.1,
+        max_depth=best_hp.get("max_depth", 4),
+        learning_rate=best_hp.get("learning_rate", 0.1),
         subsample=0.8,
         colsample_bytree=0.8,
         eval_metric="mlogloss",
@@ -414,6 +568,8 @@ def run(clustered_csv, model_pkl, figures_dir) -> dict:
     plot_feature_importance(xgb, avail_features, figures_dir / "feature_importance.png")
     plot_shap(xgb, X_train, avail_features, figures_dir / "shap_summary.png")
     plot_shap_per_class(xgb, X_train, avail_features, class_names, figures_dir)
+    plot_roc_auc(xgb, X_test, y_test, class_names, n_classes, figures_dir / "roc_auc.png")
+    plot_learning_curve(xgb, X_train, y_train, figures_dir / "learning_curve.png")
 
     # ── Random Forest (comparison) ──────────────────────────────────────────
     print("\n[Random Forest] Training ...")
