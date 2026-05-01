@@ -5,11 +5,14 @@ anomaly_detection.py
 ====================
 Detects anomalous whale behaviour using a two-layer approach:
 
-Layer 1 — Global anomalies (Isolation Forest, auto threshold):
-    Addresses whose overall feature profile is statistically unusual
-    compared to the entire whale population.  Uses contamination="auto"
-    so the threshold is derived from the score distribution rather than
-    an arbitrary percentage.
+Layer 1 — Local anomalies (Local Outlier Factor):
+    Addresses whose density neighbourhood is significantly sparser than
+    their neighbours'.  LOF compares the local reachability density of
+    each point to that of its k nearest neighbours — a score >> 1 means
+    the point is in a much sparser region, i.e. a local outlier.
+    Unlike Isolation Forest (which finds *global* outliers), LOF catches
+    a small whale (10 ETH) that behaves oddly *for its peer group* even
+    if it looks unremarkable at the population level.
 
 Layer 2 — Intra-cluster anomalies (Mahalanobis distance):
     Addresses that belong to a KMeans cluster but deviate significantly
@@ -22,7 +25,7 @@ of which features contributed most to the anomaly score.
 
 Outputs:
   data/anomaly_scores.csv      — per-address scores, labels, explanations
-  data/anomaly_scores_plot.png — score distribution with auto threshold
+  data/anomaly_scores_plot.png — LOF score distribution
   data/anomaly_timeline.png    — whale anomaly count vs ETH price over time
 
 Run:
@@ -37,7 +40,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from pathlib import Path
-from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import RobustScaler
 from scipy.spatial.distance import mahalanobis
 
@@ -108,31 +111,45 @@ def load_address_features(features_csv, labeled_csv=None, clustered_csv=None):
     return df, source.name
 
 
-# ── Layer 1: Global anomalies (Isolation Forest) ───────────────────────────
+# ── Layer 1: Local anomalies (Local Outlier Factor) ────────────────────────
 
-def detect_global_anomalies(df: pd.DataFrame, X_scaled: np.ndarray) -> pd.DataFrame:
+def detect_global_anomalies(df: pd.DataFrame, X_scaled: np.ndarray,
+                             n_neighbors: int = 20,
+                             contamination: float = 0.05) -> pd.DataFrame:
     """
-    Isolation Forest with contamination='auto'.
+    Local Outlier Factor (LOF) for local anomaly detection.
 
-    Instead of forcing a fixed % of anomalies, the algorithm uses the
-    theoretical threshold from the original paper (Liu et al., 2008):
-    score < 0 → anomaly.  This means the number of anomalies is
-    data-driven, not arbitrarily chosen.
+    LOF compares the local reachability density of each point to that of
+    its k nearest neighbours.  A score >> 1 means the point sits in a
+    much sparser region than its neighbours — a local outlier.
+
+    Key advantage over Isolation Forest: LOF detects a small whale
+    (e.g. 10 ETH) that behaves oddly *for its peer group* even if it
+    looks unremarkable at the population level.
+
+    Parameters
+    ----------
+    n_neighbors : int
+        Number of neighbours used to estimate local density (default 20).
+    contamination : float
+        Expected fraction of outliers; used to set the decision threshold
+        (default 0.05 = 5 %).
     """
-    iso = IsolationForest(
-        n_estimators=300,
-        contamination="auto",
-        random_state=42,
+    lof = LocalOutlierFactor(
+        n_neighbors=n_neighbors,
+        contamination=contamination,
         n_jobs=-1,
     )
     df = df.copy()
-    df["iso_label"] = iso.fit_predict(X_scaled)       # -1 = anomaly
-    df["iso_score"] = iso.score_samples(X_scaled)      # lower → more anomalous
+    df["iso_label"] = lof.fit_predict(X_scaled)          # -1 = anomaly
+    # negative_outlier_factor_: more negative → more anomalous
+    df["iso_score"] = lof.negative_outlier_factor_
 
     n_anom = (df["iso_label"] == -1).sum()
     pct = n_anom / len(df) * 100
-    print(f"  Global anomalies (Isolation Forest, auto): {n_anom} / {len(df)} ({pct:.1f}%)")
-    return df, iso
+    print(f"  Local anomalies (LOF, k={n_neighbors}, contamination={contamination}): "
+          f"{n_anom} / {len(df)} ({pct:.1f}%)")
+    return df, lof
 
 
 # ── Layer 2: Intra-cluster anomalies (Mahalanobis) ─────────────────────────
@@ -238,11 +255,11 @@ def compute_feature_contributions(df: pd.DataFrame, X_scaled: np.ndarray,
 def combine_anomaly_labels(df: pd.DataFrame) -> pd.DataFrame:
     """
     Final anomaly label:
-      -1 = anomalous (flagged by Isolation Forest OR intra-cluster Mahalanobis)
+      -1 = anomalous (flagged by LOF OR intra-cluster Mahalanobis)
        1 = normal
 
     anomaly_type column explains which layer(s) triggered:
-      'global'        — Isolation Forest only
+      'global'        — LOF only
       'intra-cluster' — Mahalanobis only
       'both'          — flagged by both methods
       'normal'        — not anomalous
@@ -288,15 +305,15 @@ def plot_anomaly_score_distribution(df: pd.DataFrame, out_path: Path):
     ax.hist(normal, bins=bins, color="#3498db", alpha=0.7, label="Normal whale")
     ax.hist(anomaly, bins=bins, color="#e74c3c", alpha=0.8, label="Anomalous whale")
 
-    # Show the auto threshold (score = 0 boundary for IF "auto")
+    # Show the LOF decision threshold (max score among anomalies)
     if len(anomaly) > 0:
         threshold = anomaly.max()
         ax.axvline(threshold, color="#f39c12", linestyle="--", lw=2,
-                   label=f"IF threshold ({threshold:.3f})")
+                   label=f"LOF threshold ({threshold:.3f})")
 
-    ax.set_xlabel("Isolation Forest Score (lower = more anomalous)", color="white")
+    ax.set_xlabel("LOF Score (more negative = more anomalous)", color="white")
     ax.set_ylabel("Number of addresses", color="white")
-    ax.set_title("Whale Anomaly Score Distribution (auto threshold)", color="white", fontsize=13)
+    ax.set_title("Whale Anomaly Score Distribution (LOF)", color="white", fontsize=13)
     ax.tick_params(colors="white")
     ax.spines[:].set_color("#333")
     ax.legend(framealpha=0.3, labelcolor="white", facecolor="#1a1a1a")
@@ -464,8 +481,8 @@ def run(features_csv, anomaly_csv, figures_dir, raw_csv=None, clustered_csv=None
     scaler = RobustScaler()
     X_scaled = scaler.fit_transform(df_feat.values)
 
-    # Layer 1: Global anomalies
-    print("\n[Layer 1] Isolation Forest (contamination=auto) ...")
+    # Layer 1: Local anomalies
+    print("\n[Layer 1] Local Outlier Factor (k=20, contamination=0.05) ...")
     df, iso = detect_global_anomalies(df, X_scaled)
 
     # Layer 2: Intra-cluster anomalies

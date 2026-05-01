@@ -26,15 +26,17 @@ import streamlit as st
 warnings.filterwarnings("ignore")
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent
+BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = BASE_DIR / "data"
+RAW_DIR = DATA_DIR / "raw"
+PROCESSED_DIR = DATA_DIR / "processed"
 MODELS_DIR = BASE_DIR / "models"
 
-RAW_CSV = DATA_DIR / "raw_whale_transactions.csv"
-LABELED_CSV = DATA_DIR / "labeled_addresses.csv"
-ANOMALY_CSV = DATA_DIR / "anomaly_scores.csv"
-CLUSTERED_CSV = DATA_DIR / "clustered_addresses.csv"
-KNOWN_CSV = DATA_DIR / "known_addresses.csv"
+RAW_CSV = RAW_DIR / "raw_whale_transactions.csv"
+LABELED_CSV = PROCESSED_DIR / "labeled_addresses.csv"
+ANOMALY_CSV = PROCESSED_DIR / "anomaly_scores.csv"
+CLUSTERED_CSV = PROCESSED_DIR / "clustered_addresses.csv"
+KNOWN_CSV = DATA_DIR / "external" / "known_addresses.csv"
 MODEL_PKL = MODELS_DIR / "whale_classifier.pkl"
 
 FEATURE_COLS = [
@@ -572,7 +574,7 @@ with tab2:
 
                     score = row.iloc[0].get("iso_score", None)
                     if score is not None:
-                        st.metric("Isolation Forest Score", f"{score:.4f}")
+                        st.metric("LOF Score", f"{score:.4f}")
 
                     mahal = row.iloc[0].get("mahal_distance", None)
                     if mahal is not None and not np.isnan(mahal):
@@ -628,7 +630,7 @@ with tab2:
 with tab3:
     st.subheader("Anomaly Explorer")
     st.caption(
-        "Two-layer detection: **Layer 1** (Isolation Forest) finds globally unusual addresses. "
+        "Two-layer detection: **Layer 1** (Local Outlier Factor) finds locally unusual addresses. "
         "**Layer 2** (Mahalanobis) finds addresses that deviate from their own cluster."
     )
 
@@ -644,7 +646,7 @@ with tab3:
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Total Anomalies", f"{n_anom} / {n_total}", f"{n_anom/n_total*100:.1f}%")
-        m2.metric("Global (IF)", f"{n_global + n_both}")
+        m2.metric("Global (LOF)", f"{n_global + n_both}")
         m3.metric("Intra-Cluster", f"{n_cluster + n_both}")
         m4.metric("Both Layers", f"{n_both}")
 
@@ -687,7 +689,7 @@ with tab3:
         st.dataframe(
             anom_view[avail_cols].rename(columns={
                 "anomaly_type": "Type",
-                "anomaly_score": "IF Score",
+                "anomaly_score": "LOF Score",
                 "anomaly_explanation": "Explanation",
                 "kmeans_cluster": "Cluster",
                 "total_eth_out": "ETH Out",
@@ -722,9 +724,9 @@ with tab3:
                                    annotation_text=f"Threshold: {threshold:.3f}")
 
             fig_dist.update_layout(
-                title="Isolation Forest Score Distribution",
+                title="LOF Score Distribution",
                 template="plotly_dark",
-                xaxis_title="Score (lower = more anomalous)",
+                xaxis_title="Score (more negative = more anomalous)",
                 yaxis_title="Count",
                 barmode="overlay",
                 height=320,
@@ -950,6 +952,6 @@ st.markdown("---")
 st.caption(
     "DeepWhale — Behavioral Analysis of Crypto Whales | "
     "Data: Ethereum blockchain (Alchemy) + Binance API | "
-    "ML: KMeans clustering → XGBoost classification → SHAP explanations | "
+    "ML: KMeans clustering → XGBoost classification → SHAP explanations → LOF anomaly detection | "
     "For educational purposes only."
 )
