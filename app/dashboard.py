@@ -12,6 +12,7 @@ Four tabs:
 
 from __future__ import annotations
 
+import os
 import pickle
 import warnings
 from pathlib import Path
@@ -26,13 +27,22 @@ import streamlit as st
 warnings.filterwarnings("ignore")
 
 # ── Paths ────────────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).parent.parent
+# Override if Streamlit is started from another cwd: export DEEPWHALE_PROJECT_ROOT=/path/to/deepwhale_analysis_ml
+_BASE = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(os.environ.get("DEEPWHALE_PROJECT_ROOT", str(_BASE))).resolve()
 DATA_DIR = BASE_DIR / "data"
 RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 MODELS_DIR = BASE_DIR / "models"
+ADDRESS_FEATURES_CSV = PROCESSED_DIR / "address_features.csv"
 
-RAW_CSV = RAW_DIR / "raw_whale_transactions.csv"
+# Prefer data/raw/; also check processed/ and alternate filenames (local layouts vary).
+WHALE_TX_CANDIDATES = [
+    RAW_DIR / "raw_whale_transactions.csv",
+    RAW_DIR / "raw_whale_transactions_new.csv",
+    PROCESSED_DIR / "raw_whale_transactions.csv",
+    DATA_DIR / "raw_whale_transactions.csv",
+]
 LABELED_CSV = PROCESSED_DIR / "labeled_addresses.csv"
 ANOMALY_CSV = PROCESSED_DIR / "anomaly_scores.csv"
 CLUSTERED_CSV = PROCESSED_DIR / "clustered_addresses.csv"
@@ -53,35 +63,134 @@ LOG_COLS = [
 ]
 
 CLUSTER_NAMES = {
-    0: "Large One-Shot Movers",
-    1: "Mega-Whale Traders",
-    2: "Small Whales",
-    3: "Mid-Range Regulars",
+    0: "Small Whales",
+    1: "Mid-Range Regulars",
+    2: "Large One-Shot Movers",
+    3: "Mega-Whale Traders",
 }
 
 CLUSTER_COLORS = {
-    "0": "#e74c3c",
-    "1": "#3498db",
-    "2": "#2ecc71",
-    "3": "#f39c12",
+    "0": "#2ecc71",
+    "1": "#f39c12",
+    "2": "#3498db",
+    "3": "#e74c3c",
 }
 
 CLUSTER_ICONS = {
-    0: "🎯",
-    1: "🐋",
-    2: "🐟",
-    3: "🔄",
+    0: "🐟",
+    1: "🔄",
+    2: "🎯",
+    3: "🐋",
 }
 
 
 # ── Data loaders (cached) ────────────────────────────────────────────────────
 
+
+def resolve_whale_transactions_csv() -> Path | None:
+    """Return first existing non-empty whale transactions CSV."""
+    for p in WHALE_TX_CANDIDATES:
+        try:
+            if p.is_file() and p.stat().st_size > 0:
+                return p.resolve()
+        except OSError:
+            continue
+    return None
+
+
+def _raw_tx_cache_key(path: Path | None) -> tuple[str, float, int]:
+    """Path + mtime + size so Streamlit cache invalidates when the file appears or updates."""
+    if path is None:
+        return ("", 0.0, 0)
+    try:
+        st = path.stat()
+        return (str(path), st.st_mtime, st.st_size)
+    except OSError:
+        return ("", 0.0, 0)
+
+
 @st.cache_data(ttl=60)
-def load_raw_transactions() -> pd.DataFrame:
-    if not RAW_CSV.exists():
+def load_raw_transactions(_cache_key: tuple[str, float, int]) -> pd.DataFrame:
+    path_str, _, _ = _cache_key
+    if not path_str:
         return pd.DataFrame()
-    df = pd.read_csv(RAW_CSV, parse_dates=["timestamp"])
+    path = Path(path_str)
+    if not path.is_file():
+        return pd.DataFrame()
+    df = pd.read_csv(path, parse_dates=["timestamp"])
     return df.sort_values("timestamp", ascending=False)
+
+
+def _file_cache_key(path: Path) -> tuple[str, float, int]:
+    if not path.is_file():
+        return ("", 0.0, 0)
+    try:
+        st = path.stat()
+        return (str(path.resolve()), st.st_mtime, st.st_size)
+    except OSError:
+        return ("", 0.0, 0)
+
+
+@st.cache_data(ttl=120)
+def load_address_features_table(_cache_key: tuple[str, float, int]) -> pd.DataFrame:
+    """Per-address aggregates (fallback when raw tx CSV is missing)."""
+    path_str, _, _ = _cache_key
+    if not path_str:
+        return pd.DataFrame()
+    path = Path(path_str)
+    if not path.is_file():
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+
+def synthetic_live_table_from_features(feat_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per address for the Live Whales tab when only address_features.csv exists.
+    Uses total_eth_out as a stand-in for 'size' and last_seen as the activity timestamp.
+    """
+    if feat_df.empty or "address" not in feat_df.columns:
+        return pd.DataFrame()
+    df = feat_df.copy()
+    ts = pd.to_datetime(df.get("last_seen"), errors="coerce")
+    ts_fb = pd.to_datetime(df.get("first_seen"), errors="coerce")
+    ts = ts.fillna(ts_fb)
+    out = pd.DataFrame({
+        "timestamp": ts,
+        "from_address": df["address"].astype(str),
+        "to_address": "(aggregated)",
+        "value_eth": pd.to_numeric(df.get("total_eth_out"), errors="coerce").fillna(0.0),
+        "tx_hash": "addr-" + df["address"].astype(str).str.slice(2, 14),
+    })
+    if "total_usd_out" in df.columns:
+        out["value_usd"] = pd.to_numeric(df["total_usd_out"], errors="coerce")
+    else:
+        out["value_usd"] = 0.0
+    out = out.dropna(subset=["timestamp", "from_address"])
+    return out.sort_values("timestamp", ascending=False)
+
+
+def resolve_feature_vector(
+    address: str,
+    raw_df: pd.DataFrame,
+    features_df: pd.DataFrame,
+    known_set: set,
+    live_synthetic: bool,
+) -> list[float] | None:
+    """Prefer raw tx reconstruction; if synthetic-only or missing in raw, use precomputed features."""
+    if not live_synthetic and raw_df is not None and not raw_df.empty:
+        v = build_feature_vector(address, raw_df, known_set)
+        if v is not None:
+            return v
+    if features_df is not None and not features_df.empty and "address" in features_df.columns:
+        m = features_df["address"].str.lower() == address.strip().lower()
+        if m.any():
+            row = features_df.loc[m].iloc[0]
+            vec = []
+            for c in FEATURE_COLS:
+                x = row.get(c, 0)
+                vec.append(float(x) if x is not None and not (isinstance(x, float) and np.isnan(x)) else 0.0)
+            return vec
+    return None
 
 
 @st.cache_data(ttl=300)
@@ -291,7 +400,15 @@ def predict_cluster(feature_vector: list[float], model_bundle: dict) -> dict:
 
 
 # ── Load all data ────────────────────────────────────────────────────────────
-raw_df = load_raw_transactions()
+features_df = load_address_features_table(_file_cache_key(ADDRESS_FEATURES_CSV))
+_tx_path = resolve_whale_transactions_csv()
+raw_df = load_raw_transactions(_raw_tx_cache_key(_tx_path))
+
+LIVE_WHALE_SYNTHETIC = False
+if raw_df.empty and not features_df.empty:
+    raw_df = synthetic_live_table_from_features(features_df)
+    LIVE_WHALE_SYNTHETIC = True
+
 anomaly_df = load_anomaly()
 clustered_df = load_clustered()
 model_bundle = load_model()
@@ -307,7 +424,16 @@ st.caption("Real-time classification, anomaly detection, and market analysis of 
 # Top KPIs
 c1, c2, c3, c4, c5 = st.columns(5)
 with c1:
-    st.metric("Whale Transactions", f"{len(raw_df):,}" if not raw_df.empty else "—")
+    _m1 = f"{len(raw_df):,}" if not raw_df.empty else "—"
+    st.metric(
+        "Whale profiles" if LIVE_WHALE_SYNTHETIC else "Whale Transactions",
+        _m1,
+        help=(
+            "Aggregated rows from address_features.csv (no per-tx file)"
+            if LIVE_WHALE_SYNTHETIC
+            else None
+        ),
+    )
 with c2:
     n_addr = raw_df["from_address"].nunique() if not raw_df.empty else 0
     st.metric("Unique Addresses", f"{n_addr:,}")
@@ -341,8 +467,25 @@ with tab1:
     st.subheader("Recent Whale Transactions")
 
     if raw_df.empty:
-        st.warning("No transaction data found. Run `python data_collection.py` first.")
+        st.warning(
+            "No whale data found. Run `python data_collection.py` and/or `feature_engineering.py`, "
+            "or place `raw_whale_transactions.csv` under `data/raw/` (or `address_features.csv` under "
+            "`data/processed/`)."
+        )
+        with st.expander("Checked paths"):
+            st.code(
+                f"BASE_DIR={BASE_DIR}\n\n"
+                + "\n".join(str(p) for p in WHALE_TX_CANDIDATES)
+                + f"\n{ADDRESS_FEATURES_CSV}",
+                language="text",
+            )
     else:
+        if LIVE_WHALE_SYNTHETIC:
+            st.info(
+                "Showing **aggregated whale profiles** (one row per address from `address_features.csv`) "
+                "because `raw_whale_transactions.csv` was not found. Hourly chart counts profiles by `last_seen`, "
+                "not individual transactions."
+            )
         # Filters
         col_f1, col_f2, col_f3, col_f4 = st.columns([1.5, 1.5, 1.5, 1.5])
         with col_f1:
@@ -492,7 +635,9 @@ with tab2:
         addr_lower = addr_input.strip().lower()
 
         # Build feature vector
-        feat_vec = build_feature_vector(addr_input.strip(), raw_df, known_set) if not raw_df.empty else None
+        feat_vec = resolve_feature_vector(
+            addr_input.strip(), raw_df, features_df, known_set, LIVE_WHALE_SYNTHETIC,
+        )
 
         col_class, col_status = st.columns([1, 1])
 
@@ -553,7 +698,10 @@ with tab2:
             elif not model_bundle:
                 st.info("No model found. Run `python classification.py` first.")
             else:
-                st.warning("Address not found in collected transactions.")
+                st.warning(
+                    "Address not found in transaction dump or `address_features.csv`. "
+                    "Collect on-chain data for this address first."
+                )
 
         with col_status:
             st.markdown("#### Anomaly Status")
@@ -945,6 +1093,69 @@ with tab4:
             )
             fig_sc.update_traces(marker=dict(size=7, opacity=0.75, line=dict(width=0.3, color="white")))
             st.plotly_chart(fig_sc, use_container_width=True)
+
+        # ── Label distribution per cluster ───────────────────────────────────
+        if "label" in clustered_df.columns:
+            st.markdown("---")
+            st.subheader("Heuristic Label Distribution per Trader Type")
+            st.caption(
+                "P(label | cluster) — within each KMeans cluster, what share of addresses "
+                "carries each heuristic label. Shows how well the two segmentation schemes align."
+            )
+
+            label_cluster = clustered_df.copy()
+            label_cluster["cluster_name"] = label_cluster["kmeans_cluster"].map(CLUSTER_NAMES)
+
+            # Contingency table: counts
+            ct = (
+                label_cluster.groupby(["cluster_name", "label"])
+                .size()
+                .reset_index(name="count")
+            )
+            # Conditional share P(label | cluster)
+            totals = ct.groupby("cluster_name")["count"].transform("sum")
+            ct["pct"] = ct["count"] / totals * 100
+
+            col_l1, col_l2 = st.columns([3, 2])
+
+            with col_l1:
+                fig_label = px.bar(
+                    ct,
+                    x="cluster_name",
+                    y="pct",
+                    color="label",
+                    template="plotly_dark",
+                    title="Label Share within Each Trader Type (100% stacked)",
+                    labels={"cluster_name": "Trader Type", "pct": "% of cluster", "label": "Label"},
+                    barmode="stack",
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                )
+                fig_label.update_layout(
+                    height=380,
+                    xaxis_tickangle=-20,
+                    yaxis=dict(range=[0, 100], ticksuffix="%"),
+                    legend=dict(orientation="h", y=-0.25),
+                )
+                st.plotly_chart(fig_label, use_container_width=True)
+
+            with col_l2:
+                # Heatmap of raw counts for context
+                pivot = ct.pivot(index="label", columns="cluster_name", values="count").fillna(0).astype(int)
+                fig_heat = px.imshow(
+                    pivot,
+                    template="plotly_dark",
+                    title="Raw Counts (label × cluster)",
+                    color_continuous_scale="Blues",
+                    text_auto=True,
+                    aspect="auto",
+                )
+                fig_heat.update_layout(height=380, coloraxis_showscale=False)
+                st.plotly_chart(fig_heat, use_container_width=True)
+
+            st.caption(
+                "Note: dominant `unknown_whale` label reflects heuristic coverage, not model quality. "
+                "Strong overlap between a cluster and a label = the two schemes agree on that segment."
+            )
 
 
 # ── Footer ────────────────────────────────────────────────────────────────────
